@@ -5,7 +5,7 @@ import logging
 
 import httpx
 
-from backend.services.config import get_service_config, load_config
+from backend.services.config import get_service_config, load_config, qbittorrent_login_succeeded
 from backend.services.registry import KNOWN_SERVICES
 
 logger = logging.getLogger(__name__)
@@ -230,7 +230,7 @@ async def get_qbittorrent_stats() -> dict:
                 f"{url}/api/v2/auth/login",
                 data={"username": username, "password": password},
             )
-            if login_resp.text != "Ok.":
+            if not qbittorrent_login_succeeded(login_resp):
                 return {"configured": True, "error": "Authentication failed"}
 
             cookies = login_resp.cookies
@@ -306,7 +306,7 @@ async def get_qbittorrent_torrents(filter_type: str = "seeding") -> dict:
                 f"{url}/api/v2/auth/login",
                 data={"username": username, "password": password},
             )
-            if login_resp.text != "Ok.":
+            if not qbittorrent_login_succeeded(login_resp):
                 return {"configured": True, "error": "Auth failed", "torrents": []}
             resp = await client.get(
                 f"{url}/api/v2/torrents/info",
@@ -355,7 +355,7 @@ async def qbittorrent_torrent_action(action: str, hashes: list[str]) -> dict:
                 f"{url}/api/v2/auth/login",
                 data={"username": username, "password": password},
             )
-            if login_resp.text != "Ok.":
+            if not qbittorrent_login_succeeded(login_resp):
                 return {"ok": False, "message": "Authentication failed"}
 
             data: dict[str, str] = {"hashes": "|".join(hashes)}

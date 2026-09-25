@@ -22,6 +22,19 @@ MASKED_PREFIX = "****"
 SENSITIVE_KEYS = {"api_key", "password", "token"}
 
 
+def qbittorrent_login_succeeded(resp: httpx.Response) -> bool:
+    """Return True if a qBittorrent ``/api/v2/auth/login`` response succeeded.
+
+    qBittorrent 4.x returns body ``Ok.``.
+    qBittorrent 5.x returns HTTP 204 with an empty body and a SID cookie.
+    Failed logins return 204 (or 200) with no session cookie.
+    """
+    text = (resp.text or "").strip()
+    if text in ("Ok.", "Ok"):
+        return True
+    return resp.status_code in (200, 204) and bool(resp.cookies)
+
+
 class PanelarrConfig(BaseModel):
     services: dict[str, dict] = {}
     notifications: dict = {"channels": [], "rules": []}
@@ -392,7 +405,7 @@ async def _test_qbittorrent(
         f"{url}/api/v2/auth/login",
         data={"username": username, "password": password},
     )
-    if resp.text == "Ok.":
+    if qbittorrent_login_succeeded(resp):
         return {"ok": True, "message": "Connected"}
     return {"ok": False, "message": "Authentication failed"}
 

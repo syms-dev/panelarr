@@ -25,6 +25,12 @@ Minor alpha bumps (`0.2.0-alpha`, `0.3.0-alpha`, etc.) happen on meaningful mile
 
 ## [0.1.0-alpha] - Unreleased
 
+### Fixed
+
+- qBittorrent 5.x WebUI login is accepted during setup and downloads.
+  v5 returns HTTP 204 with an empty body and a SID cookie instead of the
+  v4 ``Ok.`` body, which previously always showed "Authentication failed".
+
 ### Removed
 
 - **`.env` file is gone.** Panelarr no longer ships `.env.example` and
