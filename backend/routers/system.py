@@ -7,6 +7,7 @@ import re
 import shutil
 import time
 from importlib.metadata import version as pkg_version
+from pathlib import Path
 
 import httpx
 import psutil
@@ -86,6 +87,9 @@ def _collect_disks(filter_by_config: bool = True) -> list[dict]:
         if mp in _SKIP_MOUNTS:
             continue
         if any(mp.startswith(p) for p in _SKIP_PREFIXES):
+            continue
+        # Docker file bind-mounts appear as partitions; they are not disks.
+        if not Path(mp).is_dir():
             continue
         _try_add(mp)
 

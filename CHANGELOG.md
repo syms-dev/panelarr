@@ -25,6 +25,10 @@ Minor alpha bumps (`0.2.0-alpha`, `0.3.0-alpha`, etc.) happen on meaningful mile
 
 ## [0.1.0-alpha] - Unreleased
 
+### Fixed
+
+- Disk Usage no longer lists Docker **file** bind-mounts (e.g. a mounted entrypoint script). Only directory mountpoints are treated as disks.
+
 ### Removed
 
 - **`.env` file is gone.** Panelarr no longer ships `.env.example` and
