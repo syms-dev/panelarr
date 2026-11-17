@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { cn, formatBytes, formatDate, formatSize } from "./utils";
+import { cn, formatBytes, formatDate, formatSize, parseDate, safeHref } from "./utils";
 
 describe("cn", () => {
   it("merges class names", () => {
@@ -22,8 +22,8 @@ describe("cn", () => {
 
 describe("formatSize", () => {
   it("returns em-dash for falsy input", () => {
-    expect(formatSize(0)).toBe(", ");
-    expect(formatSize(null)).toBe(", ");
+    expect(formatSize(0)).toBe("—");
+    expect(formatSize(null)).toBe("—");
   });
 
   it("formats GB for values >= 1 GB", () => {
@@ -49,12 +49,40 @@ describe("formatBytes", () => {
 
 describe("formatDate", () => {
   it("returns em-dash for empty input", () => {
-    expect(formatDate(null)).toBe(", ");
-    expect(formatDate("")).toBe(", ");
+    expect(formatDate(null)).toBe("—");
+    expect(formatDate("")).toBe("—");
   });
 
   it("formats ISO dates as Mon DD, YYYY", () => {
     // Use UTC noon to dodge timezone rollover for the assertion
     expect(formatDate("2026-04-07T12:00:00Z")).toMatch(/Apr 7, 2026/);
+  });
+});
+
+describe("date-only parsing", () => {
+  it("treats YYYY-MM-DD as a local date", () => {
+    const d = parseDate("2026-04-07");
+    expect([d.getFullYear(), d.getMonth(), d.getDate()]).toEqual([2026, 3, 7]);
+    expect(formatDate("2026-04-07")).toBe("Apr 7, 2026");
+  });
+
+  it("returns null/placeholder for invalid", () => {
+    expect(parseDate("nope")).toBeNull();
+    expect(formatDate("nope")).toBe("—");
+  });
+});
+
+describe("safeHref", () => {
+  it("allows http(s)", () => {
+    expect(safeHref("https://example.com/a")).toBe("https://example.com/a");
+    expect(safeHref("http://10.0.0.1:8080")).toBe("http://10.0.0.1:8080/");
+  });
+
+  it("rejects dangerous or relative values", () => {
+    expect(safeHref("javascript:alert(1)")).toBeNull();
+    expect(safeHref("data:text/html,x")).toBeNull();
+    expect(safeHref("//evil.com")).toBeNull();
+    expect(safeHref("/relative")).toBeNull();
+    expect(safeHref(null)).toBeNull();
   });
 });

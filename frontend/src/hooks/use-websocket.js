@@ -1,66 +1,123 @@
+/**
+ * WebSocket hook with close-code aware reconnection.
+ *
+ * Server close codes: 4401 auth failed, 4403 bad origin, 4400 bad container
+ * name, 4429 too many streams, 4000 container stopped. 4401/4403/4400/4000
+ * never reconnect; everything else (4429, 1006, 1011, ...) retries with
+ * exponential backoff capped at MAX_DELAY_MS. The backoff counter resets only
+ * after a message was received, because the server accepts then closes, so a
+ * bare "open" event is not proof of a healthy stream.
+ */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000];
+export const BASE_DELAY_MS = 1000;
+export const MAX_DELAY_MS = 30_000;
+const TOO_MANY_STREAMS_MIN_DELAY_MS = 5000;
 
+/** Close codes after which reconnecting can never help. */
+const TERMINAL_STATUS = {
+  4400: "bad_request",
+  4401: "session_expired",
+  4403: "forbidden",
+  4000: "stopped",
+};
+
+/**
+ * Decide what to do after a close event.
+ *
+ * @param {number} code WebSocket close code.
+ * @returns {string|null} Terminal status name, or null if a retry is allowed.
+ */
+export function terminalStatusFor(code) {
+  return TERMINAL_STATUS[code] ?? null;
+}
+
+/**
+ * Backoff delay for the given attempt (0-based).
+ *
+ * @param {number} attempt Consecutive failed attempts so far.
+ * @param {number} code Close code that triggered the retry.
+ * @returns {number} Delay in ms, capped at MAX_DELAY_MS.
+ */
+export function backoffDelay(attempt, code) {
+  const floor = code === 4429 ? TOO_MANY_STREAMS_MIN_DELAY_MS : BASE_DELAY_MS;
+  return Math.min(MAX_DELAY_MS, Math.max(floor, BASE_DELAY_MS * 2 ** attempt));
+}
+
+/**
+ * @param {string|null} url Path such as `/ws/logs/name`; falsy disables.
+ * @param {{onMessage?: (data: string) => void, enabled?: boolean}} [options]
+ * @returns {{isConnected: boolean, status: string, closeCode: number|null,
+ *   send: (data: string) => void, close: () => void}} status is one of
+ *   idle | connecting | open | reconnecting | session_expired | forbidden |
+ *   bad_request | stopped.
+ */
 export function useWebSocket(url, { onMessage, enabled = true } = {}) {
-  const [isConnected, setIsConnected] = useState(false);
+  const [status, setStatus] = useState("idle");
+  const [closeCode, setCloseCode] = useState(null);
   const wsRef = useRef(null);
   const reconnectAttempt = useRef(0);
   const reconnectTimer = useRef(null);
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
 
-  const connect = useCallback(() => {
-    if (!url || !enabled) return;
+  useEffect(() => {
+    if (!url || !enabled) {
+      setStatus("idle");
+      return undefined;
+    }
+    let isStopped = false;
+    reconnectAttempt.current = 0;
+    setCloseCode(null);
 
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}${url}`;
-    const ws = new WebSocket(wsUrl);
+    function connect() {
+      if (isStopped) return;
+      setStatus(reconnectAttempt.current > 0 ? "reconnecting" : "connecting");
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${protocol}//${window.location.host}${url}`);
+      wsRef.current = ws;
 
-    ws.onopen = () => {
-      setIsConnected(true);
-      reconnectAttempt.current = 0;
-    };
+      ws.onopen = () => {
+        if (!isStopped) setStatus("open");
+      };
 
-    ws.onmessage = (event) => {
-      onMessageRef.current?.(event.data);
-    };
+      ws.onmessage = (event) => {
+        reconnectAttempt.current = 0;
+        onMessageRef.current?.(event.data);
+      };
 
-    ws.onclose = (event) => {
-      setIsConnected(false);
-      wsRef.current = null;
-      // Don't reconnect if the server intentionally closed the stream
-      // 4000 = container stopped, 4400 = bad request, 4401 = auth failed
-      const noReconnect = event.code >= 4000;
-      if (enabled && !noReconnect) {
-        const delay =
-          RECONNECT_DELAYS[
-            Math.min(reconnectAttempt.current, RECONNECT_DELAYS.length - 1)
-          ];
+      ws.onclose = (event) => {
+        if (wsRef.current === ws) wsRef.current = null;
+        if (isStopped) return;
+        setCloseCode(event.code);
+        const terminal = terminalStatusFor(event.code);
+        if (terminal) {
+          setStatus(terminal);
+          return;
+        }
+        setStatus("reconnecting");
+        const delay = backoffDelay(reconnectAttempt.current, event.code);
         reconnectAttempt.current += 1;
         reconnectTimer.current = setTimeout(connect, delay);
-      }
-    };
+      };
 
-    ws.onerror = () => {
-      ws.close();
-    };
+      // onerror is always followed by onclose; reconnect is handled there.
+      ws.onerror = () => {};
+    }
 
-    wsRef.current = ws;
-  }, [url, enabled]);
-
-  useEffect(() => {
     connect();
     return () => {
+      isStopped = true;
       clearTimeout(reconnectTimer.current);
-      if (wsRef.current) {
-        wsRef.current.onclose = null;
-        wsRef.current.close();
-        wsRef.current = null;
+      const ws = wsRef.current;
+      wsRef.current = null;
+      if (ws) {
+        ws.onclose = null;
+        ws.onmessage = null;
+        ws.close();
       }
-      setIsConnected(false);
     };
-  }, [connect]);
+  }, [url, enabled]);
 
   const send = useCallback((data) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -70,13 +127,14 @@ export function useWebSocket(url, { onMessage, enabled = true } = {}) {
 
   const close = useCallback(() => {
     clearTimeout(reconnectTimer.current);
-    if (wsRef.current) {
-      wsRef.current.onclose = null;
-      wsRef.current.close();
-      wsRef.current = null;
+    const ws = wsRef.current;
+    wsRef.current = null;
+    if (ws) {
+      ws.onclose = null;
+      ws.close();
     }
-    setIsConnected(false);
+    setStatus("idle");
   }, []);
 
-  return { isConnected, send, close };
+  return { isConnected: status === "open", status, closeCode, send, close };
 }

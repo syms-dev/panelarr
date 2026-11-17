@@ -6,6 +6,6 @@ export function useSetupStatus() {
     queryKey: ["setup-status"],
     queryFn: () => apiFetch("/setup/status"),
     staleTime: Infinity,
-    retry: false,
+    retry: 2,
   });
 }

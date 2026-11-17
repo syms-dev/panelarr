@@ -144,23 +144,33 @@ function NotificationsSection() {
 
   function handleAddChannel() {
     if (!newChannelName) return;
-    addChannel.mutate({
-      type: newChannelType,
-      name: newChannelName,
-      config: newChannelConfig,
-    });
-    setNewChannelName("");
-    setNewChannelConfig({});
-    setShowAddChannel(false);
+    // Only reset the form once the backend accepted the channel, so a
+    // failed add keeps the user's input.
+    addChannel.mutate(
+      {
+        type: newChannelType,
+        name: newChannelName,
+        config: newChannelConfig,
+      },
+      {
+        onSuccess: () => {
+          setNewChannelName("");
+          setNewChannelConfig({});
+          setShowAddChannel(false);
+        },
+      },
+    );
   }
 
   function handleAddRule() {
     if (!newRuleChannelId) return;
-    addRule.mutate({
-      event: newRuleEvent,
-      channel_id: newRuleChannelId,
-    });
-    setShowAddRule(false);
+    addRule.mutate(
+      {
+        event: newRuleEvent,
+        channel_id: newRuleChannelId,
+      },
+      { onSuccess: () => setShowAddRule(false) },
+    );
   }
 
   const typeDef = CHANNEL_TYPES.find((t) => t.value === newChannelType);
@@ -887,6 +897,14 @@ const EMPTY_AUTH_DRAFT = {
   proxyHeader: "Remote-User",
 };
 
+/** Split a textarea into trimmed, non-empty CIDR lines. */
+function parseCidrLines(text) {
+  return (text ?? "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
 function AuthCard() {
   const {
     mode: currentMode,
@@ -894,7 +912,9 @@ function AuthCard() {
     storedUsername,
     hasPassword,
     proxyHeader: currentProxyHeader,
+    trustedProxies,
   } = useAuth();
+  const trustedProxiesText = trustedProxies.join("\n");
   const updateAuth = useUpdateAuthConfig();
   const regenerateKey = useRegenerateApiKey();
 
@@ -912,8 +932,9 @@ function AuthCard() {
       password: "",
       confirmPassword: "",
       proxyHeader: currentProxyHeader,
+      trustedProxiesText,
     });
-  }, [currentMode, storedUsername, currentProxyHeader]);
+  }, [currentMode, storedUsername, currentProxyHeader, trustedProxiesText]);
 
   const isReadOnly = !isWritable;
   const hasModeChanged = draft.mode !== currentMode;
@@ -921,7 +942,9 @@ function AuthCard() {
     draft.mode === "basic" &&
     (draft.username !== storedUsername || draft.password !== "");
   const hasProxyChanges =
-    draft.mode === "proxy" && draft.proxyHeader !== currentProxyHeader;
+    draft.mode === "proxy" &&
+    (draft.proxyHeader !== currentProxyHeader ||
+      parseCidrLines(draft.trustedProxiesText).join("\n") !== trustedProxiesText);
 
   const canSave =
     !isReadOnly && (hasModeChanged || hasBasicChanges || hasProxyChanges);
@@ -955,7 +978,11 @@ function AuthCard() {
       };
     }
     if (draft.mode === "proxy") {
-      return { mode: "proxy", proxy_header: draft.proxyHeader || "Remote-User" };
+      return {
+        mode: "proxy",
+        proxy_header: draft.proxyHeader || "Remote-User",
+        trusted_proxies: parseCidrLines(draft.trustedProxiesText),
+      };
     }
     return { mode: draft.mode };
   }
@@ -1027,6 +1054,7 @@ function AuthCard() {
           apiKey={generatedKey}
           onGenerateApiKey={handleGenerateKey}
           isGeneratingApiKey={regenerateKey.isPending}
+          showTrustedProxies
           showCurrentBadge
         />
 
@@ -1086,18 +1114,18 @@ function AuthCard() {
             )}
             {pendingMode === "apikey" && (
               <p>
-                The browser dashboard becomes inaccessible without an{" "}
+                You will sign in to the browser dashboard with the API key, and
+                automation can send it in an{" "}
                 <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
                   X-Api-Key
                 </code>{" "}
-                header. Use this only for automation or behind a proxy that injects the
-                header.
+                header. The key is shown only once, so copy it before leaving this page.
               </p>
             )}
           </div>
           <AlertDialogFooter>
-            <AlertDialogClose asChild>
-              <Button variant="outline">Cancel</Button>
+            <AlertDialogClose render={<Button variant="outline" />}>
+              Cancel
             </AlertDialogClose>
             <Button
               onClick={async () => {
@@ -1151,10 +1179,10 @@ function RerunWizardCard() {
           want to start over from scratch.
         </p>
         <AlertDialog>
-          <AlertDialogTrigger asChild>
-            <Button variant="outline" size="sm">
-              Re-run Setup Wizard
-            </Button>
+          <AlertDialogTrigger
+            render={<Button variant="outline" size="sm" />}
+          >
+            Re-run Setup Wizard
           </AlertDialogTrigger>
           <AlertDialogContent>
             <AlertDialogHeader>
@@ -1176,8 +1204,8 @@ function RerunWizardCard() {
               </p>
             </div>
             <AlertDialogFooter>
-              <AlertDialogClose asChild>
-                <Button variant="outline">Cancel</Button>
+              <AlertDialogClose render={<Button variant="outline" />}>
+                Cancel
               </AlertDialogClose>
               <Button
                 variant="destructive"
