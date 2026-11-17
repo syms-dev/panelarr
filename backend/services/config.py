@@ -21,6 +21,46 @@ API_TIMEOUT = 10
 MASKED_PREFIX = "****"
 SENSITIVE_KEYS = {"api_key", "password", "token"}
 
+# Secret fields per notification channel type. The URL of a webhook-style
+# channel *is* the credential, so it is masked like a password.
+CHANNEL_SECRET_FIELDS: dict[str, tuple[str, ...]] = {
+    "discord": ("webhook_url",),
+    "slack": ("webhook_url",),
+    "telegram": ("bot_token",),
+    "webhook": ("url",),
+    "email": ("password",),
+}
+# A stored secret is only reused while these fields are unchanged; pointing a
+# channel at a new host with the old secret masked would hand it to that host.
+CHANNEL_DESTINATION_FIELDS: dict[str, tuple[str, ...]] = {
+    "email": ("smtp_host", "smtp_port", "username"),
+}
+
+
+class ConfigError(RuntimeError):
+    """panelarr.json exists but cannot be parsed or validated."""
+
+
+class SecretReuseError(ValueError):
+    """A masked secret would be sent to a different destination."""
+
+
+def channel_secret_fields(channel_type: str) -> tuple[str, ...]:
+    return CHANNEL_SECRET_FIELDS.get(channel_type, ("webhook_url", "bot_token", "url", "password"))
+
+
+def url_origin(url: str) -> tuple[str, str, int | None]:
+    """(scheme, host, port) used to decide whether a URL changed destination."""
+    try:
+        parsed = urlparse(url or "")
+        port = parsed.port
+    except ValueError:
+        return ("", url or "", None)
+    scheme = parsed.scheme.lower()
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return (scheme, (parsed.hostname or "").lower(), port)
+
 
 class PanelarrConfig(BaseModel):
     services: dict[str, dict] = {}
@@ -160,30 +200,58 @@ def _migrate_v1_to_v2(raw: dict) -> dict:
     return result
 
 
-def _preserve_secrets(merged: dict, original: dict) -> dict:
-    """Replace masked values in merged dict with real values from original."""
-    # Handle services dict
+def _preserve_secrets(merged: dict, original: dict, *, strict: bool = True) -> dict:
+    """Replace masked values in ``merged`` with the real values from ``original``.
+
+    A masked secret is only restored when it is going back to the same
+    destination it was saved for. If a service URL (scheme, host, port) or an
+    email channel's server changed while the secret was left masked, the
+    stored secret is not carried over: with ``strict`` a ``SecretReuseError``
+    is raised so the caller can ask for the secret again, otherwise the field
+    is blanked.
+    """
     merged_svcs = merged.get("services", {})
     orig_svcs = original.get("services", {})
     for svc_name, svc_config in merged_svcs.items():
-        if isinstance(svc_config, dict):
-            orig_svc = orig_svcs.get(svc_name, {})
-            secret_fields = get_secret_fields(svc_name)
-            for sf in secret_fields:
-                if sf in svc_config and is_masked(svc_config[sf]):
+        if not isinstance(svc_config, dict):
+            continue
+        orig_svc = orig_svcs.get(svc_name, {}) or {}
+        same_dest = url_origin(svc_config.get("url", "")) == url_origin(orig_svc.get("url", ""))
+        for sf in get_secret_fields(svc_name):
+            if sf in svc_config and is_masked(svc_config[sf]):
+                if same_dest:
                     svc_config[sf] = orig_svc.get(sf, "")
+                elif strict and orig_svc.get(sf):
+                    raise SecretReuseError(
+                        f"Service '{svc_name}': re-enter the {sf.replace('_', ' ')} "
+                        "when changing the URL"
+                    )
+                else:
+                    svc_config[sf] = ""
 
-    # Handle notification channel configs
     merged_channels = merged.get("notifications", {}).get("channels", [])
     orig_channels = original.get("notifications", {}).get("channels", [])
     orig_ch_map = {ch["id"]: ch for ch in orig_channels if "id" in ch}
     for ch in merged_channels:
         orig_ch = orig_ch_map.get(ch.get("id", ""), {})
-        ch_config = ch.get("config", {})
-        orig_config = orig_ch.get("config", {})
-        for key in ("webhook_url", "bot_token"):
+        ch_config = ch.get("config", {}) or {}
+        orig_config = orig_ch.get("config", {}) or {}
+        ch_type = ch.get("type") or orig_ch.get("type", "")
+        dest_fields = CHANNEL_DESTINATION_FIELDS.get(ch_type, ())
+        same_dest = orig_ch.get("type") == ch_type and all(
+            str(ch_config.get(f, "")) == str(orig_config.get(f, "")) for f in dest_fields
+        )
+        for key in channel_secret_fields(ch_type):
             if key in ch_config and is_masked(ch_config[key]):
-                ch_config[key] = orig_config.get(key, "")
+                if same_dest:
+                    ch_config[key] = orig_config.get(key, "")
+                elif strict and orig_config.get(key):
+                    raise SecretReuseError(
+                        f"Channel '{ch.get('name', '')}': re-enter the "
+                        f"{key.replace('_', ' ')} when changing where it is sent"
+                    )
+                else:
+                    ch_config[key] = ""
 
     return merged
 
@@ -204,6 +272,16 @@ def _migrate_config_file(config_path: Path) -> None:
 _config_cache: PanelarrConfig | None = None
 _config_cache_at: float = 0.0
 _CONFIG_TTL = 5.0
+# Last config that parsed successfully. If the file is later broken by hand,
+# Panelarr keeps running on this instead of silently falling back to defaults
+# (which would disable authentication and reopen the setup wizard).
+_last_good_config: PanelarrConfig | None = None
+_config_error: str | None = None
+
+
+def get_config_error() -> str | None:
+    """Return the current parse error for panelarr.json, if any."""
+    return _config_error
 
 
 def load_config() -> PanelarrConfig:
@@ -216,24 +294,59 @@ def load_config() -> PanelarrConfig:
     if _config_cache is not None and (now - _config_cache_at) < _CONFIG_TTL:
         return _config_cache
 
+    global _last_good_config, _config_error
     config_path = resolve_config_path()
     _migrate_config_file(config_path)
     config = PanelarrConfig()
     if config_path.is_file():
         try:
             raw = json.loads(config_path.read_text())
+            if not isinstance(raw, dict):
+                raise ValueError("top level must be a JSON object")
             # Migrate v1 format to v2 if needed
             raw = _migrate_v1_to_v2(raw)
             config = PanelarrConfig(**raw)
             logger.debug("Config loaded from %s", config_path)
-        except (json.JSONDecodeError, ValueError) as exc:
-            logger.warning("Invalid config file at %s: %s, using defaults", config_path, exc)
+        except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            # Fail closed: never fall back to defaults, which would mean
+            # auth mode "none" and an open setup wizard.
+            _config_error = f"{config_path}: {exc}"
+            if _last_good_config is not None:
+                logger.error(
+                    "Config file %s is invalid (%s); keeping the last valid config",
+                    config_path,
+                    exc,
+                )
+                _config_cache = _last_good_config
+                _config_cache_at = now
+                return _last_good_config
+            logger.error("Config file %s is invalid: %s", config_path, exc)
+            raise ConfigError(_config_error) from exc
     else:
         logger.debug("No config file at %s, using defaults", config_path)
 
+    _config_error = None
+    _last_good_config = config
     _config_cache = config
     _config_cache_at = now
     return config
+
+
+def _backup_if_corrupt(config_path: Path) -> None:
+    """Keep a copy of an unparseable config file before overwriting it."""
+    if not config_path.is_file():
+        return
+    try:
+        json.loads(config_path.read_text())
+        return
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    backup = config_path.with_name(f"{config_path.name}.corrupt-{int(time.time())}")
+    try:
+        os.replace(config_path, backup)
+        logger.error("Moved invalid config file to %s before saving", backup)
+    except OSError:
+        logger.exception("Could not back up invalid config file %s", config_path)
 
 
 def save_config(config: PanelarrConfig) -> None:
@@ -244,9 +357,10 @@ def save_config(config: PanelarrConfig) -> None:
     ``write`` and the ``replace``, the original file is left untouched and
     the temp file is cleaned up on the next save attempt.
     """
-    global _config_cache
+    global _config_cache, _config_error
     config_path = resolve_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    _backup_if_corrupt(config_path)
     data = config.model_dump()
     payload = json.dumps(data, indent=2)
 
@@ -285,6 +399,7 @@ def save_config(config: PanelarrConfig) -> None:
         raise
 
     _config_cache = None
+    _config_error = None
     # Log which services have data
     saved_svcs = [name for name, cfg in data.get("services", {}).items() if cfg.get("url")]
     logger.info("Config saved to %s, services: %s", config_path, ", ".join(saved_svcs) or "none")
@@ -297,6 +412,15 @@ def mask_secret(value: str) -> str:
     if len(value) <= 8:
         return MASKED_PREFIX
     return MASKED_PREFIX + value[-4:]
+
+
+def mask_channel(channel: dict) -> dict:
+    """Mask a channel's secret fields in place and return it."""
+    ch_config = channel.get("config", {}) or {}
+    for key in channel_secret_fields(channel.get("type", "")):
+        if key in ch_config and isinstance(ch_config[key], str):
+            ch_config[key] = mask_secret(ch_config[key])
+    return channel
 
 
 def get_masked_config() -> dict:
@@ -314,10 +438,7 @@ def get_masked_config() -> dict:
 
     # Mask notification channel secrets
     for ch in data.get("notifications", {}).get("channels", []):
-        ch_config = ch.get("config", {})
-        for key in ("webhook_url", "bot_token"):
-            if key in ch_config and isinstance(ch_config[key], str):
-                ch_config[key] = mask_secret(ch_config[key])
+        mask_channel(ch)
 
     # Never expose auth secrets
     data.pop("auth", None)
@@ -355,7 +476,8 @@ def _build_config_for_test(service: str, override: dict | None = None) -> Panela
     else:
         data.setdefault("services", {})[service] = override
 
-    data = _preserve_secrets(data, original)
+    # Lenient: a masked secret is dropped (not reused) when the URL changed.
+    data = _preserve_secrets(data, original, strict=False)
     return PanelarrConfig(**data)
 
 
@@ -392,7 +514,9 @@ async def _test_qbittorrent(
         f"{url}/api/v2/auth/login",
         data={"username": username, "password": password},
     )
-    if resp.text == "Ok.":
+    # qBittorrent < 5.1 answers "Ok."; 5.1+ answers 204 with an empty body.
+    body = resp.text.strip()
+    if resp.is_success and (body == "Ok." or (body == "" and resp.status_code == 204)):
         return {"ok": True, "message": "Connected"}
     return {"ok": False, "message": "Authentication failed"}
 
@@ -456,6 +580,11 @@ async def test_service_connection(service: str, override: dict | None = None) ->
         webhook = cfg.get("webhook_url", override.get("discord_webhook", ""))
         if not webhook or is_masked(webhook):
             return {"ok": False, "message": "No webhook URL configured"}
+        from backend.services.security import check_outbound_url
+
+        blocked = await check_outbound_url(webhook)
+        if blocked:
+            return {"ok": False, "message": blocked}
         try:
             async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
                 resp = await client.post(webhook, json={"content": "Panelarr test notification"})
@@ -464,8 +593,16 @@ async def test_service_connection(service: str, override: dict | None = None) ->
         except Exception as exc:
             return {"ok": False, "message": type(exc).__name__}
 
+    from backend.services.security import check_outbound_url
+
+    url = svc_config.get("url", "")
+    if url:
+        blocked = await check_outbound_url(url)
+        if blocked:
+            return {"ok": False, "message": blocked}
+
     try:
-        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT, follow_redirects=False) as client:
             svc_info = KNOWN_SERVICES.get(service)
             svc_type = svc_info["type"] if svc_info else None
 

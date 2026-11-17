@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -24,21 +23,39 @@ from backend.routers import (
     system,
 )
 from backend.services.arr import close_http_client
-from backend.services.auth import COOKIE_NAME, validate_api_key, verify_token
-from backend.services.auth_config import get_effective_auth_mode, is_setup_complete
+from backend.services.auth import authenticate
+from backend.services.auth_config import (
+    get_effective_auth_mode,
+    get_or_create_calendar_token,
+    is_auth_configured,
+)
+from backend.services.config import ConfigError, load_config
+from backend.services.security import is_state_changing, origin_allowed
 
 _log = logging.getLogger("panelarr.startup")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Application lifespan: warn about missing auth on startup, close
+    """Application lifespan: report config/auth problems on startup, close
     shared HTTP clients on shutdown."""
     try:
-        if get_effective_auth_mode() == "none":
-            _log.warning(
-                "Panelarr is running without authentication. "
-                "Set an auth mode under Settings → Authentication for security."
+        try:
+            load_config()
+            if is_auth_configured() and get_effective_auth_mode() == "none":
+                _log.warning(
+                    "Panelarr is running without authentication. "
+                    "Set an auth mode under Settings → Authentication for security."
+                )
+            elif not is_auth_configured():
+                _log.warning(
+                    "Setup has not been completed. Open Panelarr and finish the setup "
+                    "wizard before exposing it to other machines."
+                )
+        except ConfigError as exc:
+            _log.error(
+                "panelarr.json is invalid, so the API is disabled until it is fixed or removed: %s",
+                exc,
             )
         yield
     finally:
@@ -60,75 +77,85 @@ app = FastAPI(
     version=_get_version(),
     description="Self-hosted control center for Docker-based media server stacks",
     lifespan=lifespan,
+    # Docs live under /api so the auth middleware covers them.
+    docs_url="/api/docs",
+    redoc_url=None,
+    openapi_url="/api/openapi.json",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["X-Api-Key", "Content-Type", "X-Confirm-Reset"],
-)
+# No CORS middleware: the SPA is served from the same origin, and allowing
+# other origins would let any website drive the API from a user's browser.
+
+# Reachable without authentication in every mode.
+_PUBLIC_PATHS = {
+    "/api/healthz",
+    "/api/setup/status",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/status",
+}
+_CALENDAR_FEED = "/api/calendar/feed.ics"
+
+
+def _calendar_token_ok(request: Request) -> bool:
+    import secrets
+
+    provided = request.query_params.get("token", "")
+    if not provided:
+        return False
+    expected = get_or_create_calendar_token()
+    return secrets.compare_digest(provided.encode(), expected.encode())
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Enforce authentication based on AUTH_MODE."""
-    mode = get_effective_auth_mode()
+    """Authenticate every /api request.
+
+    WebSockets do not pass through HTTP middleware; ``routers/logs.py``
+    applies the same ``authenticate`` and ``origin_allowed`` checks itself.
+    """
     path = request.url.path
-
-    # Setup status is always public, the SPA hits it on every page load
-    # to decide whether to redirect to /setup or to the dashboard, so it
-    # cannot be auth-gated even after the wizard has finished.
-    if path == "/api/setup/status":
+    if not path.startswith("/api/"):
+        # SPA shell and static assets; the frontend handles redirects.
         return await call_next(request)
 
-    # Setup endpoints are open while the wizard hasn't finished, except
-    # /reset which requires auth even in mode=none (it's destructive).
-    if path.startswith("/api/setup/") and path != "/api/setup/reset" and not is_setup_complete():
+    if is_state_changing(request.method) and not origin_allowed(request):
+        return JSONResponse(status_code=403, content={"detail": "Cross-origin request refused"})
+
+    if path == "/api/healthz":
         return await call_next(request)
 
-    # Mode none, no auth
-    if mode == "none":
-        return await call_next(request)
-
-    # Only login, logout, and status are public auth endpoints.
-    # Write endpoints (PUT /api/auth/config, POST /api/auth/apikey/regenerate)
-    # must go through mode-specific auth checks below.
-    if path in ("/api/auth/login", "/api/auth/logout", "/api/auth/status"):
-        return await call_next(request)
-
-    # Static files (SPA) always accessible, frontend handles redirect to /login
-    if not path.startswith("/api/") and not path.startswith("/ws/"):
-        return await call_next(request)
-
-    # API key check, works alongside any mode when configured
-    api_key = request.headers.get("X-Api-Key", "")
-    if api_key and validate_api_key(api_key):
-        return await call_next(request)
-
-    # Mode-specific checks
-    if mode == "basic":
-        token = request.cookies.get(COOKIE_NAME)
-        if token and verify_token(token):
+    try:
+        if path in _PUBLIC_PATHS:
             return await call_next(request)
+
+        if path == _CALENDAR_FEED and request.method == "GET" and _calendar_token_ok(request):
+            return await call_next(request)
+
+        if not is_auth_configured():
+            # Fresh install: only the wizard is reachable until its auth step
+            # has been saved. /setup/reset is never public.
+            if path.startswith("/api/setup/") and path != "/api/setup/reset":
+                return await call_next(request)
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Setup required", "code": "setup_required"},
+            )
+
+        if authenticate(request) is not None:
+            return await call_next(request)
+    except ConfigError as exc:
         return JSONResponse(
-            status_code=401,
-            content={"detail": "Authentication required"},
+            status_code=503,
+            content={
+                "detail": f"panelarr.json is invalid, fix or remove it: {exc}",
+                "code": "config_invalid",
+            },
         )
 
-    if mode == "proxy":
-        # Proxy handles auth, we just pass through
-        return await call_next(request)
-
-    if mode == "apikey":
-        # No valid API key was found above
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Valid API key required"},
-        )
-
-    return await call_next(request)
+    apikey_mode = get_effective_auth_mode() == "apikey"
+    detail = "Valid API key required" if apikey_mode else "Authentication required"
+    return JSONResponse(status_code=401, content={"detail": detail})
 
 
 @app.middleware("http")
@@ -138,12 +165,27 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    csp = (
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self'"
-    )
+    if request.url.path == "/api/docs":
+        # Swagger UI loads its bundle from a CDN.
+        csp = (
+            "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "img-src 'self' data: https://fastapi.tiangolo.com; frame-ancestors 'none'"
+        )
+    else:
+        csp = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        )
     response.headers["Content-Security-Policy"] = csp
     return response
+
+
+@app.get("/api/healthz", include_in_schema=False)
+async def healthz() -> dict:
+    """Unauthenticated liveness probe for the container HEALTHCHECK."""
+    return {"status": "ok"}
 
 
 app.include_router(setup.router)
@@ -170,9 +212,13 @@ if static_dir.is_dir():
     @app.get("/{path:path}")
     async def spa_fallback(path: str) -> FileResponse:
         """Serve static files or fall back to index.html for SPA routing."""
+        if path == "api" or path.startswith("api/"):
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=404, detail="Not found")
         file_path = (static_dir / path).resolve()
         # Prevent path traversal, file must be within static_dir
-        if not str(file_path).startswith(str(static_dir.resolve())):
+        if not file_path.is_relative_to(static_dir.resolve()):
             return FileResponse(static_dir / "index.html")
         if file_path.is_file():
             return FileResponse(file_path)

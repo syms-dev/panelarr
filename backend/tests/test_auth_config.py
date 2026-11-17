@@ -97,11 +97,26 @@ def test_set_auth_writes_bcrypt_hash(config_path: Path) -> None:
     assert verify_password("hunter2", auth["password_hash"])
 
 
-def test_set_auth_preserves_secret(config_path: Path) -> None:
-    # Pre-populate with an existing secret
+def test_set_auth_preserves_secret_without_credential_change(config_path: Path) -> None:
+    config_path.write_text(json.dumps({"auth": {"secret": "existingsecret", "username": "bob"}}))
+
+    import backend.services.config as svc_cfg
+
+    svc_cfg._config_cache = None
+
+    from backend.services.auth_config import set_auth_in_config
+
+    set_auth_in_config(mode="basic", proxy_header="X-User")
+
+    data = json.loads(config_path.read_text())
+    assert data["auth"]["secret"] == "existingsecret"
+    assert data["auth"]["username"] == "bob"
+
+
+def test_set_auth_rotates_secret_on_password_change(config_path: Path) -> None:
+    """A new password must invalidate every existing session."""
     config_path.write_text(json.dumps({"auth": {"secret": "existingsecret"}}))
 
-    # Bust the cache so we read from the new file
     import backend.services.config as svc_cfg
 
     svc_cfg._config_cache = None
@@ -111,7 +126,7 @@ def test_set_auth_preserves_secret(config_path: Path) -> None:
     set_auth_in_config(mode="basic", username="bob", password="pass")
 
     data = json.loads(config_path.read_text())
-    assert data["auth"]["secret"] == "existingsecret"
+    assert data["auth"]["secret"] not in ("", "existingsecret")
     assert data["auth"]["username"] == "bob"
 
 
