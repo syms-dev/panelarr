@@ -86,28 +86,42 @@ def set_auth_in_config(
     password: str | None = None,
     proxy_header: str | None = None,
     api_key: str | None = None,
+    trusted_proxies: list[str] | None = None,
+    calendar_token: str | None = None,
 ) -> None:
     """Write auth fields to panelarr.json, preserving existing auth.secret.
 
-    Only non-None arguments are written. Password is bcrypt-hashed before storage.
+    Only non-None arguments are written. Password is bcrypt-hashed before
+    storage. Changing the password, the username or the API key rotates the
+    session signing secret, which logs out every other session.
     """
-    from backend.services.auth import hash_password
+    from backend.services.auth import hash_password, rotate_secret
     from backend.services.config import load_config, save_config
 
     config = load_config()
     # config.auth is a plain dict, preserve existing fields (e.g. secret)
     auth: dict = dict(config.auth) if config.auth else {}  # type: ignore[arg-type]
 
+    rotate = False
     if mode is not None:
         auth["mode"] = mode
     if username is not None:
+        rotate = rotate or auth.get("username") != username
         auth["username"] = username
     if password is not None:
         auth["password_hash"] = hash_password(password)
+        rotate = True
     if proxy_header is not None:
         auth["proxy_header"] = proxy_header
     if api_key is not None:
         auth["api_key"] = api_key
+        rotate = True
+    if trusted_proxies is not None:
+        auth["trusted_proxies"] = trusted_proxies
+    if calendar_token is not None:
+        auth["calendar_token"] = calendar_token
+    if rotate and auth.get("secret"):
+        rotate_secret(auth)
 
     # Rebuild config with updated auth block
     data = config.model_dump()
@@ -115,6 +129,42 @@ def set_auth_in_config(
     from backend.services.config import PanelarrConfig
 
     save_config(PanelarrConfig(**data))
+
+
+def get_trusted_proxies() -> list[str]:
+    from backend.services.security import get_trusted_proxies as _get
+
+    return _get()
+
+
+def get_or_create_calendar_token() -> str:
+    """Return the read-only token that authorises the ICS feed URL."""
+    from backend.services.config import load_config
+
+    config = load_config()
+    token = (config.auth or {}).get("calendar_token", "")
+    if token:
+        return token
+    import secrets
+
+    token = secrets.token_urlsafe(24)
+    set_auth_in_config(calendar_token=token)
+    return token
+
+
+def is_auth_configured() -> bool:
+    """True once the wizard's auth step has been saved (or setup is done).
+
+    Until then only the setup endpoints are reachable, so a freshly started
+    instance exposes nothing but the wizard. Legacy installs that predate the
+    wizard count as configured once ``is_setup_complete`` backfills them.
+    """
+    from backend.services.config import load_config
+
+    config = load_config()
+    if (config.auth or {}).get("mode"):
+        return True
+    return is_setup_complete()
 
 
 def is_setup_complete() -> bool:

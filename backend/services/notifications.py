@@ -186,32 +186,25 @@ async def _send_email(cfg: dict, title: str, body: str) -> bool:
 
 
 def _is_safe_url(url: str) -> bool:
-    """Reject non-http(s) schemes, private/loopback/link-local IPs, and metadata hosts.
+    """Synchronous pre-check kept for callers that cannot await.
 
-    Uses ipaddress module to catch all numeric forms (decimal, octal, hex,
-    IPv4-mapped IPv6) rather than matching specific strings.
+    Only inspects the URL itself. Use ``check_outbound_url`` from
+    ``backend.services.security`` (which also resolves hostnames) before
+    actually sending anything.
     """
-    import ipaddress
     from urllib.parse import urlparse
 
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
+    from backend.services.security import _blocked_address, _ip
+
+    parsed = urlparse(url or "")
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return False
-    host = (parsed.hostname or "").lower().strip("[]")
-    if not host:
-        return False
-    # Block known metadata hostnames
-    blocked_hosts = ("metadata.google.internal", "metadata.google", "localhost")
-    if any(host == b or host.endswith("." + b) for b in blocked_hosts):
-        return False
-    # Block private, loopback, link-local, and unspecified IPs in any form
-    try:
-        addr = ipaddress.ip_address(host)
-        if addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_unspecified:
-            return False
-    except ValueError:
-        pass  # Not an IP literal, hostname is fine
-    return True
+    addr = _ip(parsed.hostname)
+    return addr is None or _blocked_address(addr) is None
+
+
+def _log_safe(value: str, limit: int = 80) -> str:
+    return value[:limit].replace("\r", "\\r").replace("\n", "\\n")
 
 
 async def send_to_channel(channel: dict, title: str, body: str, color: int = 0x6366F1) -> bool:
@@ -219,10 +212,21 @@ async def send_to_channel(channel: dict, title: str, body: str, color: int = 0x6
     cfg = channel.get("config", {})
 
     # Validate webhook URLs before making any outbound request
+    from backend.services.security import check_outbound_url
+
     url_field = cfg.get("webhook_url") or cfg.get("url") or ""
-    if ch_type in ("discord", "slack", "webhook") and not _is_safe_url(url_field):
-        logger.warning("Blocked notification to unsafe URL: %s", url_field[:80])
-        return False
+    if ch_type in ("discord", "slack", "webhook"):
+        blocked = await check_outbound_url(url_field)
+        if blocked:
+            logger.warning("Blocked notification to %s: %s", _log_safe(url_field), blocked)
+            return False
+    if ch_type == "email":
+        host = (cfg.get("smtp_host") or "").strip()
+        bracketed = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        blocked = await check_outbound_url(f"http://{bracketed}") if host else None
+        if blocked:
+            logger.warning("Blocked email via %s: %s", _log_safe(host), blocked)
+            return False
 
     if ch_type == "discord":
         return await _send_discord(cfg.get("webhook_url", ""), title, body, color)

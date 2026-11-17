@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+
 from fastapi import APIRouter
 
+from backend.services.config import mask_channel
 from backend.services.notifications import (
     add_channel,
     add_rule,
@@ -18,12 +21,12 @@ router = APIRouter(prefix="/api/notifications", tags=["notifications"])
 
 @router.get("/channels")
 async def list_channels() -> list[dict]:
-    return get_channels()
+    return [mask_channel(copy.deepcopy(ch)) for ch in get_channels()]
 
 
 @router.post("/channels")
 async def create_channel(body: dict) -> dict:
-    return add_channel(body)
+    return mask_channel(copy.deepcopy(add_channel(body)))
 
 
 @router.delete("/channels/{channel_id}")
@@ -90,4 +93,6 @@ async def send_health_notification() -> dict:
     color = 0x00FF00 if health["status"] == "healthy" else 0xFF0000
 
     result = await notify_event("health_check", "Panelarr Health Check", body, color, force=True)
-    return {"ok": result["sent"] > 0 or result["failed"] == 0, **result}
+    if result["sent"] == 0 and result["failed"] == 0:
+        return {"ok": False, "message": "No channels subscribed to health checks", **result}
+    return {"ok": result["sent"] > 0, **result}
