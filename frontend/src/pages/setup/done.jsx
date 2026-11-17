@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { toastManager } from "@/components/ui/toast";
 import { useConfig, useSetupComplete } from "@/hooks/use-api";
+import { safeNextPath } from "@/lib/api";
 import { useSetupState, useSetupActions } from "@/hooks/use-setup";
 
 export default function SetupDone() {
@@ -56,15 +57,11 @@ export default function SetupDone() {
       reset();
       toastManager.add({ type: "success", title: "Setup complete! Welcome to Panelarr." });
 
-      // If basic auth was set up, redirect to login page
-      if (auth.mode === "basic") {
-        navigate("/login", { replace: true });
-      } else {
-        const target = result?.redirect ?? "/";
-        // Only allow relative paths starting with / (not //) to prevent open redirects
-        const safeTarget = typeof target === "string" && target.startsWith("/") && !target.startsWith("//") ? target : "/";
-        navigate(safeTarget, { replace: true });
-      }
+      // The setup-status and auth-status queries were awaited by the mutation,
+      // so RequireSetup/RequireAuth already see the final state. The auth step
+      // logged the user in (session cookie), so go straight to the target.
+      const safeTarget = safeNextPath(result?.redirect) ?? "/";
+      navigate(safeTarget, { replace: true });
     } catch (err) {
       toastManager.add({ type: "error", title: "Failed to complete setup", description: err.message });
     }

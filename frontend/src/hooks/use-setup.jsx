@@ -22,7 +22,45 @@ const initialState = {
   thresholds: { disk_warn_pct: 85, disk_crit_pct: 90, watchdog_threshold_hours: 2 },
   selectedDisks: [],
   discoverSeeded: false,
+  disksSeeded: false,
 };
+
+const SECRET_KEY_RE = /key|token|secret|pass(word|wd)?|webhook|credential/i;
+
+/**
+ * Deep-copy a value, dropping every property whose name looks like a secret
+ * (API keys, tokens, passwords, webhook URLs).
+ *
+ * @param {unknown} value Any JSON-like value.
+ * @returns {unknown} Copy without secret-named properties.
+ */
+function omitSecretKeys(value) {
+  if (Array.isArray(value)) return value.map(omitSecretKeys);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([k]) => !SECRET_KEY_RE.test(k))
+        .map(([k, v]) => [k, omitSecretKeys(v)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Produce the wizard state that is safe to persist in sessionStorage: no
+ * auth password, service API keys / Plex token, or notification secrets.
+ *
+ * @param {object} state Wizard state.
+ * @returns {object} Sanitised copy.
+ */
+export function stripSecrets(state) {
+  return {
+    ...state,
+    auth: omitSecretKeys(state.auth ?? {}),
+    services: omitSecretKeys(state.services ?? {}),
+    notification: omitSecretKeys(state.notification ?? null),
+  };
+}
 
 function loadFromStorage() {
   try {
@@ -66,6 +104,8 @@ function reducer(state, action) {
         : [...state.selectedDisks, action.mount];
       return { ...state, selectedDisks: next };
     }
+    case "MARK_DISKS_SEEDED":
+      return { ...state, disksSeeded: true };
     case "MARK_DISCOVER_SEEDED":
       return { ...state, discoverSeeded: true };
     case "RESET":
@@ -87,12 +127,7 @@ export function SetupProvider({ children }) {
   // sensitive fields (passwords) before serializing
   useEffect(() => {
     try {
-      const safe = { ...state };
-      if (safe.auth) {
-        const { password, confirmPassword, ...rest } = safe.auth;
-        safe.auth = rest;
-      }
-      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(safe));
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(stripSecrets(state)));
     } catch {
       // ignore storage errors (private browsing, etc.)
     }
@@ -108,6 +143,7 @@ export function SetupProvider({ children }) {
     setThresholds: (payload) => dispatch({ type: "SET_THRESHOLDS", payload }),
     setSelectedDisks: (payload) => dispatch({ type: "SET_SELECTED_DISKS", payload }),
     toggleDisk: (mount) => dispatch({ type: "TOGGLE_DISK", mount }),
+    markDisksSeeded: () => dispatch({ type: "MARK_DISKS_SEEDED" }),
     markDiscoverSeeded: () => dispatch({ type: "MARK_DISCOVER_SEEDED" }),
     reset: () => {
       dispatch({ type: "RESET" });
