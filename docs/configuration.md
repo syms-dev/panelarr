@@ -14,6 +14,8 @@ A handful of values need to be available before `panelarr.json` can be read, so 
 | `PANELARR_PORT` | `8000` | Run on a non-standard port |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Non-standard Docker socket path |
 | `CONFIG_PATH` | `/config/panelarr.json` | Store the config file elsewhere |
+| `PANELARR_TRUSTED_PROXIES` | (unset) | Comma-separated CIDRs that may set the proxy auth header and `X-Forwarded-*`. Overrides the list saved in Settings. See [proxy](#proxy) |
+| `PANELARR_ALLOWED_ORIGINS` | (unset) | Extra browser origins allowed to make changes, e.g. when a proxy rewrites `Host`. See [Cross-origin requests](#cross-origin-requests) |
 
 Set them under `environment:` in `docker-compose.yml`:
 
@@ -153,19 +155,29 @@ networks:
 
 ## Authentication
 
-Set the auth mode in the setup wizard or under Settings → Authentication. Default is `none`.
+Set the auth mode in the setup wizard or under Settings → Authentication. Panelarr controls Docker on its host, so anyone who gets past authentication effectively controls that machine. Pick a mode deliberately.
+
+Until the wizard's authentication step has been saved, only the wizard itself is reachable: every other API route answers `403 Setup required`. Finish the wizard before exposing Panelarr to other machines. Once an auth mode is saved, the wizard (including a later "Re-run setup wizard") requires the same credentials as the rest of the app.
+
+If `panelarr.json` cannot be parsed, Panelarr does **not** fall back to defaults. The API answers `503` with the parse error until you fix or remove the file, and a file that is still broken when Panelarr next saves is moved aside to `panelarr.json.corrupt-<timestamp>` first.
 
 ### none
 
-No authentication. All endpoints are public. Use this on a trusted LAN or when your reverse proxy handles auth.
+No authentication. Every endpoint is open to anyone who can reach the port. Only use this when nothing but you can reach Panelarr.
 
 ### basic
 
-Built-in username/password with JWT session cookies. Login page at `/login`. Sessions last 24 hours. The JWT signing secret is generated on first start and saved to `auth.secret` in `panelarr.json`.
+Built-in username/password with JWT session cookies (`HttpOnly`, `SameSite=Strict`, `Secure` when served over HTTPS). Login page at `/login`. Sessions last 24 hours. Signing out revokes the session, and changing the username, password or API key signs out every other session. The signing secret is generated on first start and saved to `auth.secret` in `panelarr.json`.
+
+Login attempts are limited to 10 per minute per client address (per /64 for IPv6).
 
 ### proxy
 
-Trusts a header set by an upstream proxy. Panelarr reads the authenticated username from it. The wizard auto-detects common providers and suggests the right header name.
+Trusts a header set by an authenticating reverse proxy (Authelia, Authentik, oauth2-proxy and so on) and reads the username from it.
+
+The header is only honoured when the request comes **directly from a trusted proxy address**. Anyone who can reach port 8000 directly could otherwise send the header themselves. The default trusted list is `127.0.0.1/32`, `::1/128` and `172.16.0.0/12` (Docker's default bridge networks, where Traefik usually runs). Edit it under Settings → Authentication, or pin it with `PANELARR_TRUSTED_PROXIES`. If your LAN itself uses `172.16.0.0/12`, narrow the list to your proxy's Docker network, and don't publish port 8000 at all.
+
+Panelarr refuses to switch to proxy mode unless the request making the change already carries the header from a trusted address, so you can't lock yourself out by enabling it without a working proxy. The wizard auto-detects common providers and suggests the right header name.
 
 Common headers:
 
@@ -179,7 +191,25 @@ Common headers:
 
 ### apikey
 
-Requires an `X-Api-Key` header on all API requests. Generate or rotate the key under Settings → Authentication, or via `POST /api/auth/apikey/regenerate`.
+Every API request needs an `X-Api-Key` header. The key is shown once when it is generated; rotate it under Settings → Authentication or with `POST /api/auth/apikey/regenerate`. In the browser, the login page asks for the key once and then uses a session cookie, because browsers can't add headers to page loads or WebSockets.
+
+An `X-Api-Key` header is also accepted in every other mode, which is what dashboards like Homepage should use.
+
+### Cross-origin requests
+
+Panelarr serves its own UI, so it sends no CORS headers: other websites cannot read its API from your browser. Requests that change something (POST, PUT, DELETE) and log WebSockets are refused with `403` when the browser's `Origin` doesn't match the host Panelarr was addressed by. That also covers other apps on sibling subdomains of the same domain. Clients that send no `Origin` (curl, Homepage, scripts) are unaffected. If your proxy rewrites the `Host` header, either have it pass `X-Forwarded-Host` (honoured from trusted proxies) or list the public origin in `PANELARR_ALLOWED_ORIGINS`.
+
+### Calendar feed
+
+`/api/calendar/feed.ics` takes a `token` query parameter so calendar apps can subscribe without signing in. Copy the full URL from the Calendar page. The token only opens the feed; regenerate it there if it leaks.
+
+### Health check and API docs
+
+`GET /api/healthz` is public and only reports that the process is up; the Docker `HEALTHCHECK` uses it. The interactive API docs are at `/api/docs` (OpenAPI JSON at `/api/openapi.json`) and require authentication.
+
+### Outbound requests
+
+Notification webhooks, SMTP servers and service connection tests may point at LAN and loopback addresses, which is normal in a homelab. Panelarr refuses cloud metadata endpoints, link-local and multicast addresses, and its own Docker API endpoint, after resolving hostnames. A stored API key or password is never sent to a new URL: if you change a service's URL, re-enter its key.
 
 ### Saltbox with Traefik + Authelia
 
