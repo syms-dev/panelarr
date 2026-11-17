@@ -156,7 +156,14 @@ async def test_thresholds_step_keeps_disk_selection(config_path: Path) -> None:
 def _proxy_config(path: Path) -> None:
     _write(
         path,
-        {"auth": {"mode": "proxy", "proxy_header": "Remote-User"}, "setup": {"completed_at": "t"}},
+        {
+            "auth": {
+                "mode": "proxy",
+                "proxy_header": "Remote-User",
+                "trusted_proxies": ["172.18.0.5/32"],
+            },
+            "setup": {"completed_at": "t"},
+        },
     )
 
 
@@ -474,3 +481,96 @@ async def test_cannot_stop_or_update_panelarr_itself(config_path: Path) -> None:
     async with _client() as c:
         assert (await c.post("/api/containers/panelarr/stop")).status_code == 409
         assert (await c.post("/api/containers/panelarr/update")).status_code == 409
+
+
+# --- Follow-up review findings -----------------------------------------------------------------
+
+
+async def test_docker_bridge_is_not_trusted_by_default(config_path: Path) -> None:
+    """Docker's userland proxy makes every client look like a bridge gateway."""
+    _write(
+        config_path,
+        {"auth": {"mode": "proxy", "proxy_header": "Remote-User"}, "setup": {"completed_at": "t"}},
+    )
+    async with _client(("172.17.0.1", 40000)) as c:
+        assert (await c.get("/api/config", headers={"Remote-User": "admin"})).status_code == 401
+
+
+async def test_enabling_proxy_mode_trusts_exactly_the_proxy(config_path: Path) -> None:
+    _write(config_path, {"auth": {"mode": "none"}, "setup": {"completed_at": "t"}})
+    async with _client(("172.19.0.9", 40000)) as c:
+        resp = await c.put(
+            "/api/auth/config", json={"mode": "proxy"}, headers={"Remote-User": "admin"}
+        )
+        assert resp.status_code == 200, resp.text
+    from backend.services.security import get_trusted_proxies
+
+    assert "172.19.0.9/32" in get_trusted_proxies()
+    async with _client(("172.19.0.1", 40000)) as gateway:
+        assert (await gateway.get("/api/config", headers={"Remote-User": "x"})).status_code == 401
+
+
+async def test_invalid_trusted_proxy_env_fails_closed(config_path: Path, monkeypatch) -> None:
+    _proxy_config(config_path)
+    monkeypatch.setenv("PANELARR_TRUSTED_PROXIES", "garbage")
+    async with _client(("127.0.0.1", 40000)) as c:
+        assert (await c.get("/api/config", headers={"Remote-User": "admin"})).status_code == 401
+
+
+def test_test_endpoint_does_not_send_omitted_key_to_new_url(config_path: Path) -> None:
+    from backend.services.config import _build_config_for_test
+
+    _with_sonarr(config_path)
+    moved = _build_config_for_test("sonarr", {"url": "http://attacker.example:9"})
+    assert moved.services["sonarr"]["api_key"] == ""
+    explicit = _build_config_for_test(
+        "sonarr", {"url": "http://new-host:8989", "api_key": "typed-in-key"}
+    )
+    assert explicit.services["sonarr"]["api_key"] == "typed-in-key"
+
+
+async def test_fresh_install_cannot_be_backfilled_open(config_path: Path) -> None:
+    async with _client() as c:
+        resp = await c.post(
+            "/api/setup/services", json={"services": {"sonarr": {"url": "http://a:1"}}}
+        )
+        assert resp.status_code in (200, 422)
+        # Still a fresh install: everything outside the wizard stays closed.
+        resp = await c.get("/api/config")
+        assert resp.status_code == 403 and resp.json()["code"] == "setup_required"
+
+
+async def test_logout_revocation_survives_restart(config_path: Path) -> None:
+    import backend.services.auth as auth_svc
+
+    _basic_config(config_path)
+    async with _client() as c:
+        await _login(c)
+        token = c.cookies["sp_session"]
+        await c.post("/api/auth/logout")
+    auth_svc.reset_secret_cache()  # simulate a restart (in-memory list gone)
+    async with _client() as replay:
+        replay.cookies.set("sp_session", token)
+        assert (await replay.get("/api/config")).status_code == 401
+
+
+async def test_calendar_token_is_never_created_by_a_request(config_path: Path) -> None:
+    _basic_config(config_path)
+    async with _client() as c:
+        assert (await c.get("/api/calendar/feed.ics?token=guess")).status_code == 401
+    assert "calendar_token" not in json.loads(config_path.read_text())["auth"]
+
+
+async def test_allowed_hosts_blocks_dns_rebinding(config_path: Path, monkeypatch) -> None:
+    _write(config_path, {"auth": {"mode": "none"}, "setup": {"completed_at": "t"}})
+    monkeypatch.setenv("PANELARR_ALLOWED_HOSTS", "panel.test,192.168.1.5")
+    async with _client() as c:
+        assert (await c.get("/api/config")).status_code == 200
+        assert (await c.get("/api/config", headers={"Host": "rebind.evil"})).status_code == 421
+
+
+async def test_self_update_refuses_downgrade(config_path: Path) -> None:
+    _write(config_path, {"auth": {"mode": "none"}, "setup": {"completed_at": "t"}})
+    async with _client() as c:
+        resp = await c.post("/api/system/self-update", json={"version": "0.0.1"})
+        assert resp.status_code == 422

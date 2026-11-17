@@ -9,7 +9,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from backend.services.auth import authenticate
 from backend.services.config import ConfigError
 from backend.services.docker import get_container_logs, stream_container_logs
-from backend.services.security import origin_allowed
+from backend.services.security import host_allowed, origin_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ async def _wait_for_disconnect(websocket: WebSocket) -> None:
 @router.websocket("/ws/logs/{container_name}")
 async def ws_stream_logs(websocket: WebSocket, container_name: str) -> None:
     global _active_log_streams
-    if not origin_allowed(websocket):
+    if not host_allowed(websocket) or not origin_allowed(websocket):
         await _reject(websocket, 4403, "Cross-origin connection refused")
         return
     if not _check_ws_auth(websocket):
@@ -87,8 +87,11 @@ async def ws_stream_logs(websocket: WebSocket, container_name: str) -> None:
     if _active_log_streams >= MAX_LOG_STREAMS:
         await _reject(websocket, 4429, "Too many log streams")
         return
+    try:
+        await websocket.accept()
+    except (RuntimeError, OSError, WebSocketDisconnect):
+        return
     _active_log_streams += 1
-    await websocket.accept()
     # Watch for the client going away so a quiet container doesn't keep the
     # Docker stream (and a stream slot) open forever.
     pump = asyncio.create_task(_pump_logs(websocket, container_name))

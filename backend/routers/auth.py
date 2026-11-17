@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import os
 import secrets
 import time
 from collections import OrderedDict
@@ -92,8 +93,11 @@ def issue_session(response: Response, request: Request, subject: str) -> None:
 def require_proxy_auth_on(request: Request, header: str) -> None:
     """Refuse to enable proxy mode unless this request proves it works.
 
-    Prevents locking yourself out (no proxy in front) and makes the user see
-    which address Panelarr considers the proxy.
+    The request must carry the header. If it arrives from an address that is
+    not yet trusted and the user has not configured the list explicitly,
+    exactly that address is trusted (/32 or /128): the user is, right now,
+    talking to Panelarr through it. Anything broader would also trust the
+    Docker gateway address that clients of a published port appear from.
     """
     peer = peer_host(request)
     if not request.headers.get(header, "").strip():
@@ -104,7 +108,16 @@ def require_proxy_auth_on(request: Request, header: str) -> None:
                 "authenticating reverse proxy before switching to proxy mode."
             ),
         )
-    if not is_trusted_proxy(peer):
+    if is_trusted_proxy(peer):
+        return
+    from backend.services.config import load_config
+
+    explicit = (load_config().auth or {}).get("trusted_proxies")
+    try:
+        addr = ipaddress.ip_address(peer)
+    except ValueError:
+        addr = None
+    if explicit or os.getenv("PANELARR_TRUSTED_PROXIES") or addr is None:
         raise HTTPException(
             status_code=422,
             detail=(
@@ -112,6 +125,10 @@ def require_proxy_auth_on(request: Request, header: str) -> None:
                 "not a trusted proxy. Add it to the trusted proxies list first."
             ),
         )
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    cidr = f"{addr}/{addr.max_prefixlen}"
+    set_auth_in_config(trusted_proxies=[*get_trusted_proxies(), cidr])
 
 
 def _validated_cidrs(values: list[str] | None) -> list[str] | None:

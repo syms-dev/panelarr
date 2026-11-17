@@ -244,7 +244,7 @@ export function AuthSection({
                 className="w-full rounded-lg border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
               <p className="mt-1 text-xs text-muted-foreground">
-                Only requests from these addresses may set the auth header. Defaults cover Docker networks and localhost.
+                Only requests from these addresses may set the auth header. Defaults to localhost; switching to proxy mode through your proxy adds its address automatically.
               </p>
             </div>
           )}

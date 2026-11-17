@@ -20,10 +20,12 @@ from starlette.requests import HTTPConnection
 logger = logging.getLogger(__name__)
 
 # Sources allowed to set the proxy auth header and X-Forwarded-* headers when
-# the config does not say otherwise: loopback plus Docker's default bridge
-# address pool. Users whose LAN overlaps 172.16.0.0/12 should narrow this in
-# Settings → Authentication.
-DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = ("127.0.0.1/32", "::1/128", "172.16.0.0/12")
+# the config does not say otherwise: loopback only. Trusting Docker's whole
+# 172.16.0.0/12 pool is unsafe because Docker's userland proxy (published
+# ports, Docker Desktop, rootless Docker) makes *every* client appear to come
+# from a bridge gateway address in that range. Enabling proxy mode adds the
+# proxy's own address (see routers/auth.require_proxy_auth_on).
+DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = ("127.0.0.1/32", "::1/128")
 
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
@@ -52,8 +54,10 @@ def _cached_networks(values: tuple[str, ...]) -> tuple[ipaddress._BaseNetwork, .
     try:
         return tuple(parse_cidrs(values))
     except ValueError:
-        logger.error("Invalid trusted_proxies in config %r, using defaults", values)
-        return tuple(parse_cidrs(DEFAULT_TRUSTED_PROXIES))
+        # Fail closed: an unparseable list trusts nobody rather than widening
+        # to defaults.
+        logger.error("Invalid trusted proxies %r; trusting no proxy until fixed", values)
+        return ()
 
 
 def get_trusted_proxies() -> list[str]:
@@ -119,12 +123,24 @@ def request_is_https(conn: HTTPConnection) -> bool:
     return False
 
 
+_warned_untrusted: set[str] = set()
+
+
 def proxy_user(conn: HTTPConnection, header_name: str) -> str | None:
     """Return the proxy-asserted user if the header came from a trusted proxy."""
     value = conn.headers.get(header_name, "").strip()
     if not value:
         return None
-    if not is_trusted_proxy(peer_host(conn)):
+    peer = peer_host(conn)
+    if not is_trusted_proxy(peer):
+        if peer not in _warned_untrusted and len(_warned_untrusted) < 256:
+            _warned_untrusted.add(peer)
+            logger.warning(
+                "Ignoring %s header from %s: not a trusted proxy. If this is your reverse "
+                "proxy, add it under Settings → Authentication or PANELARR_TRUSTED_PROXIES.",
+                header_name,
+                peer or "unknown address",
+            )
         return None
     return value
 
@@ -171,6 +187,22 @@ def origin_allowed(conn: HTTPConnection) -> bool:
     if parsed.port is not None and str(parsed.port) == default_port:
         candidates.add(parsed.hostname or "")
     return bool(candidates & hosts)
+
+
+def host_allowed(conn: HTTPConnection) -> bool:
+    """Optional Host allowlist (``PANELARR_ALLOWED_HOSTS``) against DNS rebinding.
+
+    Unset by default so any hostname or IP works out of the box. When set,
+    requests whose Host header isn't listed are refused, which stops a
+    rebinding page from reaching an instance running in auth mode "none".
+    """
+    raw = os.getenv("PANELARR_ALLOWED_HOSTS", "")
+    allowed = {h.strip().lower() for h in raw.split(",") if h.strip()}
+    if not allowed:
+        return True
+    host = conn.headers.get("host", "").lower()
+    name = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+    return host in allowed or name.strip("[]") in allowed or name in allowed
 
 
 def is_state_changing(method: str) -> bool:

@@ -478,6 +478,17 @@ def _build_config_for_test(service: str, override: dict | None = None) -> Panela
 
     # Lenient: a masked secret is dropped (not reused) when the URL changed.
     data = _preserve_secrets(data, original, strict=False)
+
+    # A secret the caller did not type in explicitly (omitted or masked) must
+    # never travel to a different destination than the one it was saved for.
+    if service != "discord":
+        tested = data.get("services", {}).get(service, {})
+        stored = original.get("services", {}).get(service, {}) or {}
+        if url_origin(tested.get("url", "")) != url_origin(stored.get("url", "")):
+            for sf in get_secret_fields(service):
+                supplied = override.get(sf)
+                if not isinstance(supplied, str) or not supplied or is_masked(supplied):
+                    tested[sf] = ""
     return PanelarrConfig(**data)
 
 

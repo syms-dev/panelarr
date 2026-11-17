@@ -148,7 +148,7 @@ def verify_token(token: str) -> dict | None:
     except jwt.InvalidTokenError:
         return None
     jti = payload.get("jti")
-    if jti and jti in _revoked:
+    if jti and (jti in _revoked or jti in _persisted_revoked()):
         return None
 
     from backend.services.auth_config import get_effective_auth_mode
@@ -181,7 +181,33 @@ def revoke_token(token: str) -> None:
     jti = payload.get("jti")
     if jti:
         _prune_revoked()
-        _revoked[jti] = float(payload.get("exp", time.time() + TOKEN_EXPIRY_HOURS * 3600))
+        exp = float(payload.get("exp", time.time() + TOKEN_EXPIRY_HOURS * 3600))
+        _revoked[jti] = exp
+        _persist_revocation(jti, exp)
+
+
+def _persisted_revoked() -> dict:
+    from backend.services.config import load_config
+
+    revoked = (load_config().auth or {}).get("revoked", {})
+    return revoked if isinstance(revoked, dict) else {}
+
+
+def _persist_revocation(jti: str, exp: float) -> None:
+    """Store revoked token ids in panelarr.json so a restart doesn't revive them."""
+    from backend.services.config import PanelarrConfig, load_config, save_config
+
+    config = load_config()
+    data = config.model_dump()
+    auth = data.setdefault("auth", {})
+    now = time.time()
+    revoked = {k: v for k, v in (auth.get("revoked") or {}).items() if float(v) > now}
+    revoked[jti] = exp
+    auth["revoked"] = revoked
+    try:
+        save_config(PanelarrConfig(**data))
+    except OSError:
+        logger.warning("Could not persist session revocation; it lasts until restart")
 
 
 def validate_api_key(provided: str) -> bool:
