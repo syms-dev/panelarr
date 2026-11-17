@@ -8,9 +8,6 @@ logger = logging.getLogger(__name__)
 
 VERSION = _pkg_version("panelarr")
 
-_VALID_AUTH_MODES = {"none", "basic", "proxy", "apikey"}
-
-
 #
 # All auth values live in panelarr.json. There is no env-var override:
 # the setup wizard writes them, the Settings page updates them, and the
@@ -19,14 +16,18 @@ _VALID_AUTH_MODES = {"none", "basic", "proxy", "apikey"}
 
 
 def get_effective_auth_mode() -> str:
-    """Return the configured auth mode, defaulting to 'none'."""
-    from backend.services.config import load_config
+    """Return the configured auth mode, 'none' when no mode has been chosen.
+
+    ``load_config`` already rejects an unknown mode with ``ConfigError``; the
+    check is repeated here so no code path can turn an unknown mode into
+    "no auth".
+    """
+    from backend.services.config import AUTH_MODES, ConfigError, load_config
 
     config = load_config()
-    mode = config.auth.get("mode", "none") if config.auth else "none"  # type: ignore[union-attr]
-    if mode not in _VALID_AUTH_MODES:
-        logger.warning("Invalid auth mode %r in config, falling back to 'none'", mode)
-        return "none"
+    mode = (config.auth or {}).get("mode", "none")
+    if mode not in AUTH_MODES:
+        raise ConfigError("auth.mode is not a known authentication mode")
     return mode
 
 
@@ -87,6 +88,7 @@ def set_auth_in_config(
     proxy_header: str | None = None,
     api_key: str | None = None,
     trusted_proxies: list[str] | None = None,
+    proxy_hosts: list[str] | None = None,
     calendar_token: str | None = None,
 ) -> None:
     """Write auth fields to panelarr.json, preserving existing auth.secret.
@@ -118,6 +120,8 @@ def set_auth_in_config(
         rotate = True
     if trusted_proxies is not None:
         auth["trusted_proxies"] = trusted_proxies
+    if proxy_hosts is not None:
+        auth["proxy_hosts"] = proxy_hosts
     if calendar_token is not None:
         auth["calendar_token"] = calendar_token
     if rotate and auth.get("secret"):

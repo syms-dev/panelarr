@@ -11,6 +11,7 @@ from email.message import EmailMessage
 import httpx
 
 from backend.services.config import load_config, save_config
+from backend.services.security import loggable_error
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ async def _send_discord(webhook_url: str, title: str, body: str, color: int = 0x
             )
             return resp.status_code in (200, 204)
     except Exception as exc:
-        logger.warning("Discord send error: %s", exc)
+        logger.warning("Discord send error: %s", loggable_error(exc))
         return False
 
 
@@ -65,7 +66,7 @@ async def _send_telegram(bot_token: str, chat_id: str, title: str, body: str) ->
             )
             return resp.status_code == 200
     except Exception as exc:
-        logger.warning("Telegram send error: %s", exc)
+        logger.warning("Telegram send error: %s", loggable_error(exc))
         return False
 
 
@@ -83,7 +84,7 @@ async def _send_slack(webhook_url: str, title: str, body: str) -> bool:
             )
             return resp.status_code == 200
     except Exception as exc:
-        logger.warning("Slack send error: %s", exc)
+        logger.warning("Slack send error: %s", loggable_error(exc))
         return False
 
 
@@ -96,7 +97,7 @@ async def _send_webhook(url: str, title: str, body: str, event: str = "") -> boo
             )
             return resp.status_code in (200, 201, 204)
     except Exception as exc:
-        logger.warning("Webhook send error: %s", exc)
+        logger.warning("Webhook send error: %s", loggable_error(exc))
         return False
 
 
@@ -135,7 +136,7 @@ def _smtp_send_blocking(
                 smtp.send_message(msg)
         return True
     except Exception as exc:
-        logger.warning("Email send error: %s", exc)
+        logger.warning("Email send error: %s", loggable_error(exc))
         return False
 
 
@@ -207,6 +208,10 @@ def _log_safe(value: str, limit: int = 80) -> str:
     return value[:limit].replace("\r", "\\r").replace("\n", "\\n")
 
 
+# The config field each URL-based channel type sends its request to.
+_SEND_FIELD = {"discord": "webhook_url", "slack": "webhook_url", "webhook": "url"}
+
+
 async def send_to_channel(channel: dict, title: str, body: str, color: int = 0x6366F1) -> bool:
     ch_type = channel.get("type", "")
     cfg = channel.get("config", {})
@@ -214,8 +219,11 @@ async def send_to_channel(channel: dict, title: str, body: str, color: int = 0x6
     # Validate webhook URLs before making any outbound request
     from backend.services.security import check_outbound_url
 
-    url_field = cfg.get("webhook_url") or cfg.get("url") or ""
-    if ch_type in ("discord", "slack", "webhook"):
+    # Guard exactly the field each type sends to: checking one field and
+    # sending to another let a harmless decoy pass while the real target
+    # was the Docker API.
+    url_field = cfg.get(_SEND_FIELD.get(ch_type, ""), "") or ""
+    if ch_type in _SEND_FIELD:
         blocked = await check_outbound_url(url_field)
         if blocked:
             logger.warning("Blocked notification to %s: %s", _log_safe(url_field), blocked)
@@ -229,13 +237,13 @@ async def send_to_channel(channel: dict, title: str, body: str, color: int = 0x6
             return False
 
     if ch_type == "discord":
-        return await _send_discord(cfg.get("webhook_url", ""), title, body, color)
+        return await _send_discord(url_field, title, body, color)
     elif ch_type == "telegram":
         return await _send_telegram(cfg.get("bot_token", ""), cfg.get("chat_id", ""), title, body)
     elif ch_type == "slack":
-        return await _send_slack(cfg.get("webhook_url", ""), title, body)
+        return await _send_slack(url_field, title, body)
     elif ch_type == "webhook":
-        return await _send_webhook(cfg.get("url", ""), title, body)
+        return await _send_webhook(url_field, title, body)
     elif ch_type == "email":
         return await _send_email(cfg, title, body)
     else:

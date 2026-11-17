@@ -16,7 +16,7 @@ A handful of values need to be available before `panelarr.json` can be read, so 
 | `CONFIG_PATH` | `/config/panelarr.json` | Store the config file elsewhere |
 | `PANELARR_TRUSTED_PROXIES` | (unset) | Comma-separated CIDRs that may set the proxy auth header and `X-Forwarded-*`. Overrides the list saved in Settings. See [proxy](#proxy) |
 | `PANELARR_ALLOWED_ORIGINS` | (unset) | Extra browser origins allowed to make changes, e.g. when a proxy rewrites `Host`. See [Cross-origin requests](#cross-origin-requests) |
-| `PANELARR_ALLOWED_HOSTS` | (unset) | Comma-separated hostnames/IPs Panelarr answers to; anything else gets `421`. Recommended in auth mode `none` to stop DNS-rebinding attacks from web pages |
+| `PANELARR_ALLOWED_HOSTS` | (unset) | Comma-separated hostnames/IPs Panelarr answers to; anything else gets `421`. Stops DNS-rebinding attacks from web pages: recommended in auth mode `none`. Also needed to run the setup wizard through a hostname rather than an IP address or `localhost`, and it lets the proxy header work on every listed hostname |
 
 Set them under `environment:` in `docker-compose.yml`:
 
@@ -178,7 +178,9 @@ Trusts a header set by an authenticating reverse proxy (Authelia, Authentik, oau
 
 The header is only honoured when the request comes **directly from a trusted proxy address**. Anyone who can reach port 8000 directly could otherwise send the header themselves. By default only localhost is trusted. Whole Docker networks are deliberately *not* trusted by default: when a port is published, Docker's userland proxy makes every client appear to come from the network's gateway address.
 
-To enable proxy mode, open Panelarr **through your proxy** and pick proxy mode in the wizard or Settings. Panelarr refuses unless that request carries the header, so you can't lock yourself out, and it adds the exact address the request came from (your proxy, e.g. `172.19.0.9/32`) to the trusted list. Edit the list under Settings → Authentication, or pin it with `PANELARR_TRUSTED_PROXIES` (which overrides the saved list and is the way back in if your proxy's address changes). An invalid list trusts nothing.
+To enable proxy mode, open Panelarr **through your proxy** and pick proxy mode in the wizard or Settings. Panelarr refuses unless that request carries the header, so you can't lock yourself out, and it adds the exact address the request came from (your proxy, e.g. `172.19.0.9/32`) to the trusted list. It never adds a Docker network gateway (an address like `172.18.0.1`); add that by hand only if nothing but your proxy can reach Panelarr from it. Edit the list under Settings → Authentication, or pin it with `PANELARR_TRUSTED_PROXIES` (which overrides the saved list and is the way back in if your proxy's address changes). An invalid list trusts nothing.
+
+Panelarr also remembers the **hostname** you enabled proxy mode through (e.g. `panelarr.example.com`) and honours the header only on that hostname. A web page using DNS rebinding reaches Panelarr under its own hostname, so even from a trusted address (a browser on the Panelarr host reaching it over loopback) it can't sign itself in. To use more than one hostname, re-save proxy mode through each, or list them in `PANELARR_ALLOWED_HOSTS`. Requests with the header on another hostname are logged.
 
 If your proxy's container address changes when it is recreated, give it a static IP on its Docker network, or trust its network CIDR and **don't publish port 8000**. Requests carrying the header from an untrusted address are logged with that address to make this easy to diagnose. The wizard auto-detects common providers and suggests the right header name.
 

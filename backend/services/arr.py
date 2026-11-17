@@ -11,6 +11,7 @@ import httpx
 
 from backend.services.config import get_service_config, load_config
 from backend.services.registry import KNOWN_SERVICES
+from backend.services.security import loggable_error
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,7 @@ async def get_arr_status(service_name: str) -> dict:
     try:
         return await _arr_get(url, api_key, "/api/v3/system/status")
     except httpx.HTTPError as exc:
-        logger.warning("%s status error: %s", service_name, exc)
+        logger.warning("%s status error: %s", service_name, loggable_error(exc))
         return {"configured": True, "error": _safe_error(exc)}
 
 
@@ -164,7 +165,7 @@ async def get_arr_queue(service_name: str) -> dict:
         result = await _arr_get(url, api_key, "/api/v3/queue", params=params)
         return result if isinstance(result, dict) else {"records": result}
     except httpx.HTTPError as exc:
-        logger.warning("%s queue error: %s", service_name, exc)
+        logger.warning("%s queue error: %s", service_name, loggable_error(exc))
         return {"configured": True, "error": _safe_error(exc), "records": []}
 
 
@@ -239,7 +240,9 @@ async def get_sabnzbd_stats() -> dict:
             "status": data.get("status", "Idle"),
         }
     except httpx.HTTPError as exc:
-        logger.warning("SABnzbd stats error: %s", exc)
+        # Never log exc itself: an HTTPStatusError's text has the request URL,
+        # and SABnzbd takes its API key as a query parameter.
+        logger.warning("SABnzbd stats error: %s", _safe_error(exc))
         return {"configured": True, "error": _safe_error(exc)}
 
 
@@ -353,7 +356,7 @@ async def get_qbittorrent_stats() -> dict:
                 "vpn_interface": vpn_interface,
             }
     except httpx.HTTPError as exc:
-        logger.warning("qBittorrent stats error: %s", exc)
+        logger.warning("qBittorrent stats error: %s", loggable_error(exc))
         return {"configured": True, "error": _safe_error(exc)}
 
 
@@ -499,7 +502,7 @@ async def get_arr_tasks(service_name: str) -> list[dict]:
             )
         return tasks
     except httpx.HTTPError as exc:
-        logger.warning("%s tasks error: %s", service_name, exc)
+        logger.warning("%s tasks error: %s", service_name, loggable_error(exc))
         return []
 
 
@@ -574,7 +577,7 @@ async def get_arr_history(service_name: str, limit: int = 30) -> list[dict]:
                 break
         return results
     except httpx.HTTPError as exc:
-        logger.warning("%s history error: %s", service_name, exc)
+        logger.warning("%s history error: %s", service_name, loggable_error(exc))
         return []
 
 
@@ -679,7 +682,7 @@ async def get_radarr_movies() -> list[dict]:
             )
         return movies
     except httpx.HTTPError as exc:
-        logger.warning("Radarr movies error: %s", exc)
+        logger.warning("Radarr movies error: %s", loggable_error(exc))
         return []
 
 
@@ -751,7 +754,7 @@ async def get_sonarr_series() -> list[dict]:
             )
         return series
     except httpx.HTTPError as exc:
-        logger.warning("Sonarr series error: %s", exc)
+        logger.warning("Sonarr series error: %s", loggable_error(exc))
         return []
 
 
@@ -893,7 +896,7 @@ async def get_sonarr_series_detail(series_id: int) -> dict:
             "seasons": seasons,
         }
     except httpx.HTTPError as exc:
-        logger.warning("Sonarr series detail error: %s", exc)
+        logger.warning("Sonarr series detail error: %s", loggable_error(exc))
         return {}
 
 
@@ -964,7 +967,7 @@ async def get_radarr_movie_detail(movie_id: int) -> dict:
             "movieFile": movie_file,
         }
     except httpx.HTTPError as exc:
-        logger.warning("Radarr movie detail error: %s", exc)
+        logger.warning("Radarr movie detail error: %s", loggable_error(exc))
         return {}
 
 
@@ -1045,7 +1048,7 @@ async def search_movies(query: str) -> list[dict]:
             )
         return results
     except httpx.HTTPError as exc:
-        logger.warning("Movie search error: %s", exc)
+        logger.warning("Movie search error: %s", loggable_error(exc))
         return []
 
 
@@ -1145,7 +1148,7 @@ async def search_shows(query: str) -> list[dict]:
             )
         return results
     except httpx.HTTPError as exc:
-        logger.warning("Show search error: %s", exc)
+        logger.warning("Show search error: %s", loggable_error(exc))
         return []
 
 

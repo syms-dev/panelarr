@@ -19,6 +19,7 @@ from backend.services.auth_config import (
     set_auth_in_config,
 )
 from backend.services.config import (
+    AUTH_MODES,
     PanelarrConfig,
     load_config,
     resolve_config_path,
@@ -190,9 +191,6 @@ class AuthBody(BaseModel):
     trusted_proxies: list[str] | None = None
 
 
-_VALID_MODES = {"none", "basic", "proxy", "apikey"}
-
-
 @router.post("/auth")
 async def setup_auth(body: AuthBody, request: Request) -> JSONResponse:
     """Configure authentication mode and credentials.
@@ -200,17 +198,27 @@ async def setup_auth(body: AuthBody, request: Request) -> JSONResponse:
     Once this step is saved, every other setup endpoint requires the new
     credentials, so for basic and apikey modes the response signs the user in.
     """
-    from backend.routers.auth import _validated_cidrs, issue_session, require_proxy_auth_on
+    from backend.routers.auth import (
+        _validated_cidrs,
+        issue_session,
+        proxy_hosts_with,
+        require_proxy_auth_on,
+    )
     from backend.services.auth import APIKEY_SESSION_SUB
 
     _require_setup_incomplete()
 
-    if body.mode not in _VALID_MODES:
+    if body.mode not in AUTH_MODES:
         raise HTTPException(status_code=422, detail=f"Invalid mode: {body.mode!r}")
 
+    # This endpoint is unauthenticated until a mode is saved, so nothing may
+    # be written before the request is fully validated: the trusted-proxy list
+    # is only accepted with proxy mode and saved together with it.
+    if body.trusted_proxies is not None and body.mode != "proxy":
+        raise HTTPException(
+            status_code=422, detail="trusted_proxies can only be set with proxy mode"
+        )
     trusted = _validated_cidrs(body.trusted_proxies)
-    if trusted is not None:
-        set_auth_in_config(trusted_proxies=trusted)
 
     if body.mode == "basic":
         if not body.username or not body.password:
@@ -228,8 +236,13 @@ async def setup_auth(body: AuthBody, request: Request) -> JSONResponse:
 
     if body.mode == "proxy":
         header = (body.proxy_header or "Remote-User").strip()
-        require_proxy_auth_on(request, header)
-        set_auth_in_config(mode="proxy", proxy_header=header)
+        to_trust = require_proxy_auth_on(request, header, trusted)
+        set_auth_in_config(
+            mode="proxy",
+            proxy_header=header,
+            trusted_proxies=to_trust,
+            proxy_hosts=proxy_hosts_with(request),
+        )
         return JSONResponse(content={"ok": True})
 
     if body.mode == "apikey":

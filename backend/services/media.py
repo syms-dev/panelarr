@@ -7,6 +7,7 @@ from urllib.parse import quote
 import httpx
 
 from backend.services.config import get_service_config, load_config
+from backend.services.security import loggable_error
 
 logger = logging.getLogger(__name__)
 
@@ -160,10 +161,10 @@ async def get_plex_stats() -> dict:
                 "server_url": url,
             }
     except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-        logger.warning("Plex stats error: %s", exc)
+        logger.warning("Plex stats error: %s", loggable_error(exc))
         return {"configured": True, "error": _safe_error(exc)}
     except Exception as exc:
-        logger.warning("Plex stats unexpected error: %s", exc)
+        logger.warning("Plex stats unexpected error: %s", loggable_error(exc))
         return {"configured": True, "error": _safe_error(exc)}
 
 
@@ -198,10 +199,10 @@ async def get_jellyfin_stats() -> dict:
                 "libraries": libraries,
             }
     except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-        logger.warning("Jellyfin stats error: %s", exc)
+        logger.warning("Jellyfin stats error: %s", loggable_error(exc))
         return {"configured": True, "error": _safe_error(exc)}
     except Exception as exc:
-        logger.warning("Jellyfin stats unexpected error: %s", exc)
+        logger.warning("Jellyfin stats unexpected error: %s", loggable_error(exc))
         return {"configured": True, "error": _safe_error(exc)}
 
 
@@ -236,8 +237,8 @@ async def get_emby_stats() -> dict:
                 "libraries": libraries,
             }
     except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-        logger.warning("Emby stats error: %s", exc)
+        logger.warning("Emby stats error: %s", loggable_error(exc))
         return {"configured": True, "error": _safe_error(exc)}
     except Exception as exc:
-        logger.warning("Emby stats unexpected error: %s", exc)
+        logger.warning("Emby stats unexpected error: %s", loggable_error(exc))
         return {"configured": True, "error": _safe_error(exc)}

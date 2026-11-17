@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from backend.config import settings
 from backend.services.registry import KNOWN_SERVICES, get_secret_fields
@@ -37,8 +37,31 @@ CHANNEL_DESTINATION_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
+AUTH_MODES = frozenset({"none", "basic", "proxy", "apikey"})
+
+
 class ConfigError(RuntimeError):
     """panelarr.json exists but cannot be parsed or validated."""
+
+
+def _describe_config_error(exc: Exception) -> str:
+    """Describe why panelarr.json was rejected without quoting its values.
+
+    The message reaches unauthenticated clients (the 503 ``config_invalid``
+    body) and the log, so it must never echo what the file contains: pydantic's
+    default text includes ``input_value=`` with parts of API keys.
+    """
+    if isinstance(exc, ValidationError):
+        parts = [
+            f"{'.'.join(str(p) for p in err['loc']) or 'config'}: {err['msg']}"
+            for err in exc.errors(include_input=False, include_url=False, include_context=False)
+        ]
+        return "; ".join(parts) or "validation failed"
+    if isinstance(exc, json.JSONDecodeError):
+        return f"not valid JSON (line {exc.lineno}, column {exc.colno})"
+    if isinstance(exc, OSError):
+        return f"cannot be read ({exc.strerror or type(exc).__name__})"
+    return str(exc)
 
 
 class SecretReuseError(ValueError):
@@ -78,6 +101,22 @@ class PanelarrConfig(BaseModel):
 _resolved_config_path: Path | None = None
 
 
+def _may_exist(path: Path) -> bool:
+    """False only when ``path`` is known not to exist.
+
+    ``Path.is_file()`` is not enough: from Python 3.14 it returns False when
+    the directory cannot be searched (EACCES), which would make an existing,
+    unreadable panelarr.json look like a fresh install.
+    """
+    try:
+        path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def resolve_config_path() -> Path:
     """Return a writable config file path.
 
@@ -91,6 +130,13 @@ def resolve_config_path() -> Path:
         return _resolved_config_path
 
     primary = Path(settings.config_path)
+    if _may_exist(primary) or os.getenv("CONFIG_PATH"):
+        # An existing config is always the one in force, even when its
+        # directory is not writable (disk full, read-only remount, wrong
+        # owner). Falling back would load defaults and reopen the setup
+        # wizard to anyone on the network; saves fail loudly instead.
+        _resolved_config_path = primary
+        return primary
     fallback = Path.home() / ".config" / "panelarr" / "panelarr.json"
     candidates = [primary, fallback]
 
@@ -298,7 +344,7 @@ def load_config() -> PanelarrConfig:
     config_path = resolve_config_path()
     _migrate_config_file(config_path)
     config = PanelarrConfig()
-    if config_path.is_file():
+    if _may_exist(config_path):
         try:
             raw = json.loads(config_path.read_text())
             if not isinstance(raw, dict):
@@ -306,22 +352,28 @@ def load_config() -> PanelarrConfig:
             # Migrate v1 format to v2 if needed
             raw = _migrate_v1_to_v2(raw)
             config = PanelarrConfig(**raw)
+            auth_block = config.auth or {}
+            if "mode" in auth_block and auth_block["mode"] not in AUTH_MODES:
+                # An unknown mode must not mean "no auth" (a hand-edited
+                # "Basic", or a downgrade from a version with a new mode).
+                raise ValueError(f"auth.mode must be one of {', '.join(sorted(AUTH_MODES))}")
             logger.debug("Config loaded from %s", config_path)
         except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
             # Fail closed: never fall back to defaults, which would mean
             # auth mode "none" and an open setup wizard.
-            _config_error = f"{config_path}: {exc}"
+            detail = _describe_config_error(exc)
+            _config_error = f"{config_path}: {detail}"
             if _last_good_config is not None:
                 logger.error(
                     "Config file %s is invalid (%s); keeping the last valid config",
                     config_path,
-                    exc,
+                    detail,
                 )
                 _config_cache = _last_good_config
                 _config_cache_at = now
                 return _last_good_config
-            logger.error("Config file %s is invalid: %s", config_path, exc)
-            raise ConfigError(_config_error) from exc
+            logger.error("Config file %s is invalid: %s", config_path, detail)
+            raise ConfigError(_config_error) from None
     else:
         logger.debug("No config file at %s, using defaults", config_path)
 

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from backend.services.config import get_service_config, load_config
 from backend.services.docker import get_docker_info, get_docker_version, list_containers
 from backend.services.media import get_emby_stats, get_jellyfin_stats, get_plex_stats
+from backend.services.security import RASTER_IMAGE_TYPES
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -381,11 +382,14 @@ async def plex_thumbnail(path: str) -> Response:
                     "X-Plex-Token": token,
                 },
             )
-            if resp.status_code == 200:
+            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            # Raster images only: an SVG or HTML answer would run in Panelarr's origin
+            # if opened directly.
+            if resp.status_code == 200 and content_type in RASTER_IMAGE_TYPES:
                 return Response(
                     content=resp.content,
-                    media_type=resp.headers.get("content-type", "image/jpeg"),
-                    headers={"Cache-Control": "public, max-age=3600"},
+                    media_type=content_type,
+                    headers={"Cache-Control": "private, max-age=3600"},
                 )
     except Exception:
         pass

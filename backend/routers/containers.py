@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException
 from backend.services.docker import (
     check_container_updates,
     container_action,
+    container_identity,
     get_container,
     list_containers,
     pull_and_recreate,
@@ -43,31 +44,40 @@ async def _guard_critical(name: str, action: str) -> None:
 
     Stopping or recreating either cuts Panelarr off mid-request and leaves it
     down. Panelarr updates itself through Settings → Update instead.
+
+    The name in the URL can be anything Docker resolves (a Compose name like
+    ``stack-dockerproxy-1``, an id prefix), so the target is resolved first and
+    compared by its names, hostname, network aliases and id.
     """
+    own = HTTPException(
+        status_code=409,
+        detail=f"Panelarr can't {action} its own container; use Settings → Update",
+    )
+    proxy_refused = HTTPException(
+        status_code=409,
+        detail=f"Refusing to {action} the Docker socket proxy Panelarr depends on",
+    )
     lowered = name.lower()
-    if lowered == "panelarr":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Panelarr can't {action} its own container; use Settings → Update",
-        )
     proxy = _socket_proxy_host()
+    if lowered == "panelarr":
+        raise own
     if proxy and lowered == proxy:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Refusing to {action} the Docker socket proxy Panelarr depends on",
-        )
-    own_id = os.getenv("HOSTNAME", "")
-    if len(own_id) >= 12:
-        try:
-            container = await get_container(name)
-        except Exception:  # noqa: BLE001, Docker unavailable is reported by the action
-            return
-        cid = str((container or {}).get("id", ""))
-        if cid and (cid.startswith(own_id) or own_id.startswith(cid[:12])):
-            raise HTTPException(
-                status_code=409,
-                detail=f"Panelarr can't {action} its own container; use Settings → Update",
-            )
+        raise proxy_refused
+    try:
+        target = await container_identity(name)
+    except Exception:  # noqa: BLE001, Docker unavailable is reported by the action
+        return
+    if not target:
+        return
+    own_host = os.getenv("HOSTNAME", "").lower()
+    if (
+        "panelarr" in target["names"]
+        or (own_host and own_host in target["names"])
+        or (len(own_host) >= 12 and target["id"].startswith(own_host))
+    ):
+        raise own
+    if proxy and proxy in target["names"]:
+        raise proxy_refused
 
 
 @router.get("")

@@ -11,8 +11,11 @@ import asyncio
 import ipaddress
 import logging
 import os
+import re
 import socket
+import sys
 from functools import lru_cache
+from pathlib import Path
 from urllib.parse import urlparse
 
 from starlette.requests import HTTPConnection
@@ -28,6 +31,28 @@ logger = logging.getLogger(__name__)
 DEFAULT_TRUSTED_PROXIES: tuple[str, ...] = ("127.0.0.1/32", "::1/128")
 
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+# Image types the poster and thumbnail proxies pass through. No SVG: it can carry
+# script, and a proxied image is served from Panelarr's own origin.
+RASTER_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"})
+
+_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
+
+
+def loggable_error(exc: BaseException) -> str:
+    """Describe an exception for a log line without any URL in it.
+
+    httpx puts the full request URL, query string included, in its error text,
+    and several services take their API key or token as a query parameter
+    (SABnzbd ``apikey``, Plex ``X-Plex-Token``); webhook URLs are secrets
+    themselves.
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is not None and type(exc).__name__ == "HTTPStatusError":
+        return f"HTTP {status}"
+    text = _URL_RE.sub("<url>", str(exc))
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 # ---------------------------------------------------------------------------
@@ -60,18 +85,21 @@ def _cached_networks(values: tuple[str, ...]) -> tuple[ipaddress._BaseNetwork, .
         return ()
 
 
-def get_trusted_proxies() -> list[str]:
-    """Return the configured trusted-proxy CIDRs (env overrides config)."""
+def effective_trusted_proxies(configured: object) -> list[str]:
+    """Trusted-proxy CIDRs in force for a configured list (env overrides it)."""
     env = os.getenv("PANELARR_TRUSTED_PROXIES", "").strip()
     if env:
         return [v.strip() for v in env.split(",") if v.strip()]
-    from backend.services.config import load_config
-
-    auth = load_config().auth or {}
-    configured = auth.get("trusted_proxies")
     if isinstance(configured, list) and configured:
         return [str(v) for v in configured]
     return list(DEFAULT_TRUSTED_PROXIES)
+
+
+def get_trusted_proxies() -> list[str]:
+    """Return the configured trusted-proxy CIDRs (env overrides config)."""
+    from backend.services.config import load_config
+
+    return effective_trusted_proxies((load_config().auth or {}).get("trusted_proxies"))
 
 
 def _ip(value: str | None) -> ipaddress._BaseAddress | None:
@@ -86,11 +114,76 @@ def _ip(value: str | None) -> ipaddress._BaseAddress | None:
     return addr
 
 
-def is_trusted_proxy(host: str | None) -> bool:
+def is_trusted_proxy(host: str | None, cidrs: list[str] | None = None) -> bool:
+    """True if ``host`` is in ``cidrs``, or in the trusted proxies in force."""
     addr = _ip(host)
     if addr is None:
         return False
-    return any(addr in net for net in _cached_networks(tuple(get_trusted_proxies())))
+    values = tuple(cidrs if cidrs is not None else get_trusted_proxies())
+    return any(addr in net for net in _cached_networks(values))
+
+
+def _route_gateways() -> set[ipaddress._BaseAddress]:
+    """Gateways of this container, from the kernel routing tables.
+
+    Covers the IPv4 and IPv6 next hops and the first host of every directly
+    connected IPv4 network, which is where Docker puts a bridge's gateway.
+    Empty off Linux.
+    """
+    try:
+        lines = Path("/proc/net/route").read_text().splitlines()[1:]
+    except OSError:
+        return set()
+
+    def addr(field: str) -> ipaddress.IPv4Address:
+        return ipaddress.IPv4Address(int(field, 16).to_bytes(4, sys.byteorder))
+
+    found: set[ipaddress._BaseAddress] = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        try:
+            dest, gateway, mask = addr(fields[1]), addr(fields[2]), addr(fields[7])
+        except ValueError:
+            continue
+        if int(gateway):
+            found.add(gateway)
+        elif int(mask) and int(mask) != 0xFFFFFFFF:
+            found.add(ipaddress.IPv4Address(int(dest) + 1))
+    try:
+        # Columns: destination, prefix length, source, source length, next hop, ...
+        for line in Path("/proc/net/ipv6_route").read_text().splitlines():
+            fields = line.split()
+            if len(fields) >= 5 and int(fields[4], 16):
+                found.add(ipaddress.IPv6Address(int(fields[4], 16)))
+    except (OSError, ValueError):
+        pass
+    return found
+
+
+def looks_like_docker_gateway(host: str | None) -> bool:
+    """True if ``host`` is, or looks like, a Docker network gateway.
+
+    Docker's userland proxy (published ports, Docker Desktop, rootless Docker)
+    makes every client of a published port appear from the bridge gateway, so
+    that address must never be trusted automatically. Besides the gateways in
+    the routing table, any private ``x.x.x.1`` (or ULA ``::1`` host) counts:
+    Docker reserves it for the gateway, and refusing a real proxy there only
+    means the owner adds it to the list by hand.
+    """
+    addr = _ip(host)
+    if addr is None or addr.is_loopback:
+        return False
+    if addr in _route_gateways():
+        return True
+    if isinstance(addr, ipaddress.IPv4Address):
+        return addr.is_private and addr.packed[-1] == 1
+    if addr.is_link_local or addr.is_multicast:
+        return False
+    # Docker gives an IPv6 network's gateway the first host address, ``<prefix>::1``,
+    # whatever the prefix length (/64, /80 and so on), global or ULA.
+    return int(addr) & 0xFFFFFFFFFFFF == 1
 
 
 def peer_host(conn: HTTPConnection) -> str:
@@ -126,10 +219,72 @@ def request_is_https(conn: HTTPConnection) -> bool:
 _warned_untrusted: set[str] = set()
 
 
+def request_host_name(conn: HTTPConnection) -> str:
+    """The hostname of the Host header, lower-cased, without port or brackets."""
+    host = conn.headers.get("host", "").strip().lower()
+    if host.startswith("["):
+        return host[1 : host.find("]")] if "]" in host else host[1:]
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host
+
+
+def _allowed_hosts() -> set[str]:
+    raw = os.getenv("PANELARR_ALLOWED_HOSTS", "")
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
+def setup_host_allowed(conn: HTTPConnection) -> bool:
+    """May this request reach the unauthenticated setup wizard?
+
+    Before an auth mode is saved the wizard is open to whoever reaches it, and
+    a web page can reach a loopback or LAN instance through DNS rebinding: its
+    requests then carry the attacker's own hostname in Host and Origin. So the
+    wizard only answers to an IP literal or ``localhost``, which rebinding
+    cannot produce, or to a name the owner listed in ``PANELARR_ALLOWED_HOSTS``
+    (``host_allowed`` has already refused every other name in that case).
+    """
+    if _allowed_hosts():
+        return True
+    name = request_host_name(conn)
+    return name == "localhost" or _ip(name) is not None
+
+
+def proxy_host_allowed(conn: HTTPConnection) -> bool:
+    """Is the proxy auth header honoured on this request's Host?
+
+    Loopback is a trusted proxy by default, so a DNS-rebinding page in a
+    browser on the Panelarr host reaches it from a trusted address and can set
+    the header itself. Its requests carry the attacker's hostname, though, so
+    the header only counts on the hostname(s) proxy mode was enabled through
+    (``auth.proxy_hosts``) or on ``PANELARR_ALLOWED_HOSTS``.
+    """
+    if _allowed_hosts():
+        return True
+    from backend.services.config import load_config
+
+    pinned = (load_config().auth or {}).get("proxy_hosts")
+    if not isinstance(pinned, list):
+        return False
+    return request_host_name(conn) in {str(h).lower() for h in pinned}
+
+
 def proxy_user(conn: HTTPConnection, header_name: str) -> str | None:
     """Return the proxy-asserted user if the header came from a trusted proxy."""
     value = conn.headers.get(header_name, "").strip()
     if not value:
+        return None
+    if not proxy_host_allowed(conn):
+        name = request_host_name(conn)
+        if name not in _warned_untrusted and len(_warned_untrusted) < 256:
+            _warned_untrusted.add(name)
+            logger.warning(
+                "Ignoring %s header for host %r: proxy mode was not enabled through that "
+                "hostname. Re-save proxy mode while opening Panelarr through it, or list it "
+                "in PANELARR_ALLOWED_HOSTS.",
+                header_name,
+                name,
+            )
         return None
     peer = peer_host(conn)
     if not is_trusted_proxy(peer):
@@ -175,6 +330,12 @@ def origin_allowed(conn: HTTPConnection) -> bool:
     parsed = urlparse(origin)
     if not parsed.netloc:
         return False
+    if parsed.scheme == "http" and request_is_https(conn):
+        # The page that sent this was loaded over plain HTTP while Panelarr is
+        # known to be served over HTTPS: someone on the network path may have
+        # injected it. (An https Origin on a request that looks like http is
+        # fine: a TLS-terminating proxy that is not trusted hides the scheme.)
+        return False
     hosts = {conn.headers.get("host", "").lower()}
     if is_trusted_proxy(peer_host(conn)):
         fwd = conn.headers.get("x-forwarded-host", "").split(",")[0].strip().lower()
@@ -196,8 +357,7 @@ def host_allowed(conn: HTTPConnection) -> bool:
     requests whose Host header isn't listed are refused, which stops a
     rebinding page from reaching an instance running in auth mode "none".
     """
-    raw = os.getenv("PANELARR_ALLOWED_HOSTS", "")
-    allowed = {h.strip().lower() for h in raw.split(",") if h.strip()}
+    allowed = _allowed_hosts()
     if not allowed:
         return True
     host = conn.headers.get("host", "").lower()
@@ -255,6 +415,21 @@ def _docker_endpoint() -> tuple[str, int] | None:
     return None
 
 
+async def _resolve(host: str, port: int) -> list[ipaddress._BaseAddress] | None:
+    """Addresses ``host`` resolves to (itself if it is a literal), or None."""
+    literal = _ip(host)
+    if literal is not None:
+        return [literal]
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=5
+        )
+    except (OSError, TimeoutError):
+        return None
+    return [a for a in (_ip(info[4][0]) for info in infos) if a is not None]
+
+
 async def check_outbound_url(url: str) -> str | None:
     """Return an error string if the server must not call ``url``, else None.
 
@@ -282,18 +457,19 @@ async def check_outbound_url(url: str) -> str | None:
     if docker and host == docker[0] and port == docker[1]:
         return "URL points at the Docker API"
 
-    literal = _ip(host)
-    if literal is not None:
-        addrs = [literal]
-    else:
-        try:
-            loop = asyncio.get_running_loop()
-            infos = await asyncio.wait_for(
-                loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=5
-            )
-        except (OSError, TimeoutError):
-            return None  # Unresolvable: the request itself will fail cleanly.
-        addrs = [a for a in (_ip(info[4][0]) for info in infos) if a is not None]
+    addrs = await _resolve(host, port)
+    if addrs is None:
+        return None  # Unresolvable: the request itself will fail cleanly.
+
+    if docker and port == docker[1]:
+        # Compare addresses, not names: "localhost", "127.1", another alias
+        # or the IP of the socket proxy all reach the same Docker API.
+        docker_addrs = await _resolve(docker[0], docker[1]) or []
+        for addr in addrs:
+            if addr in docker_addrs or (
+                addr.is_loopback and any(d.is_loopback for d in docker_addrs)
+            ):
+                return "URL points at the Docker API"
 
     for addr in addrs:
         reason = _blocked_address(addr)

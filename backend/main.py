@@ -30,7 +30,12 @@ from backend.services.auth_config import (
     is_auth_configured,
 )
 from backend.services.config import ConfigError, load_config
-from backend.services.security import host_allowed, is_state_changing, origin_allowed
+from backend.services.security import (
+    host_allowed,
+    is_state_changing,
+    origin_allowed,
+    setup_host_allowed,
+)
 
 _log = logging.getLogger("panelarr.startup")
 
@@ -82,6 +87,8 @@ app = FastAPI(
     docs_url="/api/docs",
     redoc_url=None,
     openapi_url="/api/openapi.json",
+    # FastAPI otherwise serves /docs/oauth2-redirect outside /api, unauthenticated.
+    swagger_ui_oauth2_redirect_url=None,
 )
 
 # No CORS middleware: the SPA is served from the same origin, and allowing
@@ -143,6 +150,17 @@ async def auth_middleware(request: Request, call_next):
             # Fresh install: only the wizard is reachable until its auth step
             # has been saved. /setup/reset is never public.
             if path.startswith("/api/setup/") and path != "/api/setup/reset":
+                if not setup_host_allowed(request):
+                    return JSONResponse(
+                        status_code=421,
+                        content={
+                            "detail": (
+                                "Run setup through Panelarr's IP address or localhost, or add "
+                                "this hostname to PANELARR_ALLOWED_HOSTS."
+                            ),
+                            "code": "setup_host",
+                        },
+                    )
                 return await call_next(request)
             return JSONResponse(
                 status_code=403,
@@ -186,6 +204,10 @@ async def security_headers(request: Request, call_next):
             "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         )
     response.headers["Content-Security-Policy"] = csp
+    if request.url.path.startswith("/api/") and "cache-control" not in response.headers:
+        # API answers carry configuration and service data: keep them out of
+        # browser and proxy caches. Image proxies set their own (private) policy.
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 

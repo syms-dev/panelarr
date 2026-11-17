@@ -354,6 +354,29 @@ async def get_container(name_or_id: str) -> dict | None:
         return _parse_container(container, stats)
 
 
+async def container_identity(name_or_id: str) -> dict | None:
+    """Resolve a name, id or id prefix to the container Docker would act on.
+
+    Returns ``{"id": <full id>, "names": {name, hostname, network aliases}}``
+    (lower-cased), or None when no such container exists.
+    """
+    async with httpx.AsyncClient(transport=_docker_transport(), timeout=DOCKER_TIMEOUT) as client:
+        resp = await client.get(_docker_url(f"/containers/{name_or_id}/json"))
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+    names = {str(data.get("Name", "")).lstrip("/")}
+    names.add(str((data.get("Config") or {}).get("Hostname", "")))
+    networks = (data.get("NetworkSettings") or {}).get("Networks") or {}
+    for net in networks.values():
+        names.update(str(a) for a in (net or {}).get("Aliases") or [])
+    return {
+        "id": str(data.get("Id", "")).lower(),
+        "names": {n.lower() for n in names if n},
+    }
+
+
 ALLOWED_ACTIONS = frozenset({"start", "stop", "restart"})
 PULL_TIMEOUT = 300  # 5 minutes for image pulls
 
@@ -1232,6 +1255,11 @@ class ImageRef:
         return bool(self.digest)
 
 
+# Registry host (with optional port), path, tag and digest characters; no
+# query, fragment, userinfo, backslash or whitespace.
+_IMAGE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,511}")
+
+
 def _split_image_ref(image: str) -> ImageRef:
     """Parse an image string into registry, repository, tag and digest.
 
@@ -1285,20 +1313,45 @@ def _parse_www_authenticate(header: str) -> dict[str, str] | None:
     return params if params.get("realm") else None
 
 
+_REGISTRY_TOKEN_MAX_BYTES = 64 * 1024
+
+
 async def _get_registry_token(client: httpx.AsyncClient, challenge: dict[str, str]) -> str:
     """Fetch (or reuse a cached) anonymous bearer token for a registry challenge."""
     realm = challenge.get("realm", "")
     if urlparse(realm).scheme not in ("http", "https"):
+        return ""
+    # The realm is chosen by whoever runs the registry, so it gets the same
+    # outbound guard as every other server-side request (metadata, link-local,
+    # the Docker API).
+    from backend.services.security import check_outbound_url
+
+    blocked = await check_outbound_url(realm)
+    if blocked:
+        logger.warning("Registry token realm refused: %s", blocked)
         return ""
     key = (realm, challenge.get("service", ""), challenge.get("scope", ""))
     cached = _registry_token_cache.get(key)
     if cached and cached[1] > time.monotonic():
         return cached[0]
     params = {k: v for k, v in (("service", key[1]), ("scope", key[2])) if v}
-    resp = await client.get(realm, params=params, timeout=REGISTRY_TIMEOUT)
-    if resp.status_code != 200:
+    # A token answer is a few KB; read at most 64 KiB so a hostile registry
+    # can't make Panelarr buffer an arbitrarily large body.
+    async with client.stream("GET", realm, params=params, timeout=REGISTRY_TIMEOUT) as resp:
+        if resp.status_code != 200:
+            return ""
+        body = b""
+        async for chunk in resp.aiter_bytes():
+            body += chunk
+            if len(body) > _REGISTRY_TOKEN_MAX_BYTES:
+                logger.warning("Registry token answer too large; ignored")
+                return ""
+    try:
+        data = json.loads(body)
+    except ValueError:
         return ""
-    data = resp.json()
+    if not isinstance(data, dict):
+        return ""
     token = data.get("token") or data.get("access_token") or ""
     if token:
         ttl = max(int(data.get("expires_in") or 60) - 10, 5)
@@ -1308,6 +1361,14 @@ async def _get_registry_token(client: httpx.AsyncClient, challenge: dict[str, st
 
 async def _registry_manifest_head(client: httpx.AsyncClient, url: str) -> httpx.Response:
     """HEAD a manifest, performing the anonymous bearer-token flow on a 401."""
+    from backend.services.security import check_outbound_url
+
+    # The registry host comes from the image reference, which an image can set
+    # through its Compose label; it gets the outbound guard like the realm.
+    blocked = await check_outbound_url(url)
+    if blocked:
+        logger.warning("Registry manifest request refused: %s", blocked)
+        return httpx.Response(204)  # no digest: reported as "no update"
     headers = {"Accept": _MANIFEST_ACCEPT}
     resp = await client.head(url, headers=headers, timeout=REGISTRY_TIMEOUT)
     if resp.status_code == 401:
@@ -1344,6 +1405,10 @@ async def _check_single_container_update(
     if not image:
         return None
 
+    if not _IMAGE_REF_RE.fullmatch(image) or ".." in image:
+        # Not a Docker image reference (the Compose label can hold anything):
+        # never let it shape a registry URL.
+        return None
     ref = _split_image_ref(image)
     if ref.pinned:
         return (
