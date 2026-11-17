@@ -50,15 +50,22 @@ function omitSecretKeys(value) {
  * Produce the wizard state that is safe to persist in sessionStorage: no
  * auth password, service API keys / Plex token, or notification secrets.
  *
+ * A notification channel's config is dropped whole rather than filtered by
+ * key name: for some channels (the generic webhook's `url`, an SMTP host with
+ * credentials) the credential sits under a name no pattern can match.
+ *
  * @param {object} state Wizard state.
  * @returns {object} Sanitised copy.
  */
 export function stripSecrets(state) {
+  const notification = state.notification
+    ? { ...omitSecretKeys(state.notification), config: {} }
+    : null;
   return {
     ...state,
     auth: omitSecretKeys(state.auth ?? {}),
     services: omitSecretKeys(state.services ?? {}),
-    notification: omitSecretKeys(state.notification ?? null),
+    notification,
   };
 }
 

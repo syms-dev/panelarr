@@ -42,10 +42,15 @@ def _write(path: Path, data: dict) -> None:
     svc_cfg._config_cache = None
 
 
-def _client(peer: tuple[str, int] = UNTRUSTED) -> AsyncClient:
+# Setup only answers to an IP literal or localhost (DNS-rebinding guard), so tests that run
+# the wizard address Panelarr by IP, as an owner on a fresh install does.
+SETUP_BASE = "http://192.0.2.10:8000"
+
+
+def _client(peer: tuple[str, int] = UNTRUSTED, base_url: str = "http://panel.test") -> AsyncClient:
     from backend.main import app
 
-    return AsyncClient(transport=ASGITransport(app=app, client=peer), base_url="http://panel.test")
+    return AsyncClient(transport=ASGITransport(app=app, client=peer), base_url=base_url)
 
 
 def _basic_config(path: Path, **extra) -> None:
@@ -107,7 +112,7 @@ async def test_fresh_install_exposes_only_the_wizard(config_path: Path) -> None:
 
 
 async def test_setup_auth_signs_user_in_and_locks_setup(config_path: Path) -> None:
-    async with _client() as c:
+    async with _client(base_url=SETUP_BASE) as c:
         resp = await c.post(
             "/api/setup/auth",
             json={"mode": "basic", "username": "admin", "password": PASSWORD},
@@ -117,7 +122,7 @@ async def test_setup_auth_signs_user_in_and_locks_setup(config_path: Path) -> No
         # The wizard continues with the new session...
         assert (await c.get("/api/config/registry")).status_code == 200
     # ...while anyone else is now locked out of the wizard.
-    async with _client() as other:
+    async with _client(base_url=SETUP_BASE) as other:
         assert (await other.post("/api/setup/auth", json={"mode": "none"})).status_code == 401
         assert (await other.get("/api/config/registry")).status_code == 401
 
@@ -161,6 +166,7 @@ def _proxy_config(path: Path) -> None:
                 "mode": "proxy",
                 "proxy_header": "Remote-User",
                 "trusted_proxies": ["172.18.0.5/32"],
+                "proxy_hosts": ["panel.test"],
             },
             "setup": {"completed_at": "t"},
         },
@@ -530,7 +536,7 @@ def test_test_endpoint_does_not_send_omitted_key_to_new_url(config_path: Path) -
 
 
 async def test_fresh_install_cannot_be_backfilled_open(config_path: Path) -> None:
-    async with _client() as c:
+    async with _client(base_url=SETUP_BASE) as c:
         resp = await c.post(
             "/api/setup/services", json={"services": {"sonarr": {"url": "http://a:1"}}}
         )

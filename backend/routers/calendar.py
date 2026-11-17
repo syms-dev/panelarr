@@ -37,7 +37,7 @@ def _parse_date(value: str | None, *, fallback: datetime) -> datetime:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
         return dt.astimezone(UTC)
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid date '{value[:40]}': expected YYYY-MM-DD or ISO-8601",

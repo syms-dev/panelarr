@@ -29,12 +29,16 @@ from backend.services.auth_config import (
     is_auth_writable,
     set_auth_in_config,
 )
+from backend.services.config import AUTH_MODES
 from backend.services.security import (
     client_ip,
+    effective_trusted_proxies,
     get_trusted_proxies,
     is_trusted_proxy,
+    looks_like_docker_gateway,
     parse_cidrs,
     peer_host,
+    request_host_name,
     request_is_https,
 )
 
@@ -86,18 +90,36 @@ def issue_session(response: Response, request: Request, subject: str) -> None:
         samesite="strict",
         path="/",
         max_age=TOKEN_EXPIRY_HOURS * 3600,
-        secure=request_is_https(request),
+        secure=request_is_https(request) or _forwarded_https(request),
     )
 
 
-def require_proxy_auth_on(request: Request, header: str) -> None:
+def _forwarded_https(request: Request) -> bool:
+    """True if any peer says the browser is on HTTPS.
+
+    Unlike ``request_is_https`` this needs no trusted proxy: the answer only
+    makes the cookie stricter (``Secure``), so a forged header harms nobody,
+    while ignoring it would send the session over plain HTTP behind a proxy
+    that terminates TLS but is not in the trusted list.
+    """
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return proto == "https"
+
+
+def require_proxy_auth_on(
+    request: Request, header: str, requested: list[str] | None = None
+) -> list[str] | None:
     """Refuse to enable proxy mode unless this request proves it works.
 
-    The request must carry the header. If it arrives from an address that is
-    not yet trusted and the user has not configured the list explicitly,
-    exactly that address is trusted (/32 or /128): the user is, right now,
-    talking to Panelarr through it. Anything broader would also trust the
-    Docker gateway address that clients of a published port appear from.
+    Saves nothing: returns the trusted-proxy list to write together with the
+    mode, or None to keep the current one. ``requested`` is a list sent in the
+    same request; the header must then come from an address in it.
+
+    Otherwise, if the header arrives from an address that is not yet trusted
+    and the owner has not configured the list explicitly, exactly that address
+    is trusted (/32 or /128): the owner is, right now, talking to Panelarr
+    through it. A Docker network gateway is never trusted this way, because
+    every client of a published port can appear from it.
     """
     peer = peer_host(request)
     if not request.headers.get(header, "").strip():
@@ -108,8 +130,18 @@ def require_proxy_auth_on(request: Request, header: str) -> None:
                 "authenticating reverse proxy before switching to proxy mode."
             ),
         )
+    if requested is not None:
+        if is_trusted_proxy(peer, effective_trusted_proxies(requested)):
+            return requested
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"The {header} header came from {peer or 'an unknown address'}, which is "
+                "not in the trusted proxies list you entered."
+            ),
+        )
     if is_trusted_proxy(peer):
-        return
+        return None
     from backend.services.config import load_config
 
     explicit = (load_config().auth or {}).get("trusted_proxies")
@@ -125,10 +157,32 @@ def require_proxy_auth_on(request: Request, header: str) -> None:
                 "not a trusted proxy. Add it to the trusted proxies list first."
             ),
         )
+    if looks_like_docker_gateway(peer):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"The {header} header came from {peer}, which looks like a Docker network "
+                "gateway: every client of a published port can appear from that address, so "
+                "it is not trusted automatically. Put your proxy on Panelarr's Docker network "
+                "and open Panelarr through it, or add the address to the trusted proxies list "
+                "only if nothing else can reach Panelarr from it."
+            ),
+        )
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
         addr = addr.ipv4_mapped
-    cidr = f"{addr}/{addr.max_prefixlen}"
-    set_auth_in_config(trusted_proxies=[*get_trusted_proxies(), cidr])
+    return [*get_trusted_proxies(), f"{addr}/{addr.max_prefixlen}"]
+
+
+def proxy_hosts_with(request: Request) -> list[str]:
+    """The pinned proxy hostnames plus the one this request came through."""
+    from backend.services.config import load_config
+
+    current = (load_config().auth or {}).get("proxy_hosts")
+    hosts = [str(h).lower() for h in current] if isinstance(current, list) else []
+    name = request_host_name(request)
+    if name and name not in hosts:
+        hosts.append(name)
+    return hosts
 
 
 def _validated_cidrs(values: list[str] | None) -> list[str] | None:
@@ -228,9 +282,6 @@ async def auth_status(request: Request) -> dict:
     return response
 
 
-_VALID_MODES = {"none", "basic", "proxy", "apikey"}
-
-
 class AuthConfigBody(BaseModel):
     mode: str
     username: str | None = None
@@ -247,11 +298,11 @@ async def update_auth_config(body: AuthConfigBody, request: Request) -> JSONResp
     time. Changing the password or username logs out every other session;
     the caller gets a fresh cookie so they stay signed in.
     """
-    if body.mode not in _VALID_MODES:
+    if body.mode not in AUTH_MODES:
         raise HTTPException(status_code=422, detail=f"Invalid mode: {body.mode!r}")
+    # Validated first and written in the same save as the mode, so a request
+    # that is refused below leaves no trusted proxies behind.
     trusted = _validated_cidrs(body.trusted_proxies)
-    if trusted is not None:
-        set_auth_in_config(trusted_proxies=trusted)
 
     reissue: str | None = None
 
@@ -263,13 +314,19 @@ async def update_auth_config(body: AuthConfigBody, request: Request) -> JSONResp
         # it blank, preserves the existing hash.
         if body.password:
             try:
-                set_auth_in_config(mode="basic", username=body.username, password=body.password)
+                set_auth_in_config(
+                    mode="basic",
+                    username=body.username,
+                    password=body.password,
+                    trusted_proxies=trusted,
+                )
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
         elif current_hash and body.username == username:
-            set_auth_in_config(mode="basic")  # mode-only refresh, keep existing creds
+            # Mode-only refresh, keep existing creds.
+            set_auth_in_config(mode="basic", trusted_proxies=trusted)
         elif current_hash:
-            set_auth_in_config(mode="basic", username=body.username)
+            set_auth_in_config(mode="basic", username=body.username, trusted_proxies=trusted)
         else:
             raise HTTPException(
                 status_code=422,
@@ -279,21 +336,25 @@ async def update_auth_config(body: AuthConfigBody, request: Request) -> JSONResp
 
     elif body.mode == "proxy":
         header = (body.proxy_header or get_effective_proxy_header() or "Remote-User").strip()
-        require_proxy_auth_on(request, header)
-        set_auth_in_config(mode="proxy", proxy_header=header)
+        to_trust = require_proxy_auth_on(request, header, trusted)
+        set_auth_in_config(
+            mode="proxy",
+            proxy_header=header,
+            trusted_proxies=to_trust,
+            proxy_hosts=proxy_hosts_with(request),
+        )
 
     elif body.mode == "apikey":
         # Mode switch only, does not regenerate the key. Use
         # POST /api/auth/apikey/regenerate to mint a fresh one.
         from backend.services.auth_config import get_effective_api_key
 
-        if not get_effective_api_key():
-            set_auth_in_config(api_key=secrets.token_urlsafe(32))
-        set_auth_in_config(mode="apikey")
+        new_key = None if get_effective_api_key() else secrets.token_urlsafe(32)
+        set_auth_in_config(mode="apikey", api_key=new_key, trusted_proxies=trusted)
         reissue = APIKEY_SESSION_SUB
 
     else:
-        set_auth_in_config(mode="none")
+        set_auth_in_config(mode="none", trusted_proxies=trusted)
 
     response = JSONResponse(content={"ok": True})
     if reissue:

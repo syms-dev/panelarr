@@ -113,9 +113,9 @@ Panelarr needs the Docker socket (`/var/run/docker.sock`) to manage containers o
 
 Whoever can use Panelarr can control Docker, and through it the host. Panelarr is built around that:
 
-- **Nothing but the setup wizard is reachable until you choose an auth mode**, and after that the wizard needs the same credentials as everything else. Finish setup before exposing the port.
+- **Nothing but the setup wizard is reachable until you choose an auth mode**, and after that the wizard needs the same credentials as everything else. Finish setup before exposing the port. Until then the wizard only answers when you open Panelarr by IP address or `localhost` (or a name in `PANELARR_ALLOWED_HOSTS`), so a web page can't use DNS rebinding to run it for you.
 - **A broken `panelarr.json` fails closed**: the API returns 503 until it is fixed, instead of falling back to "no auth".
-- **Proxy mode trusts the auth header only from trusted proxy addresses** (loopback and Docker networks by default, configurable), and won't switch on unless your proxy is actually in front.
+- **Proxy mode trusts the auth header only from trusted proxy addresses** (loopback only by default, configurable), and won't switch on unless your proxy is actually in front. Enabling proxy mode through your proxy trusts exactly that proxy's address, never a Docker network gateway, and the header only counts on the hostname you enabled it through.
 - **No cross-site access**: no CORS, and changes and log WebSockets from other origins (including sibling subdomains) are refused. Sessions are `HttpOnly`/`SameSite=Strict`, revoked on sign-out, and invalidated by password changes.
 - **Secrets stay put**: API keys, passwords and webhook URLs are masked in every response, and a stored secret is never sent to a changed URL.
 - **Outbound requests** to cloud metadata, link-local addresses or the Docker API are refused.

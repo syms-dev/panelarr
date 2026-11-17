@@ -52,12 +52,15 @@ def test_auth_mode_default(config_path: Path) -> None:
     assert get_effective_auth_mode() == "none"
 
 
-def test_auth_mode_invalid_falls_back_to_none(config_path: Path) -> None:
+def test_auth_mode_invalid_fails_closed(config_path: Path) -> None:
+    # An unknown mode must never mean "no auth" (2026-11-17-auth-sessions/F7).
     config_path.write_text(json.dumps({"auth": {"mode": "nonsense"}}))
 
     from backend.services.auth_config import get_effective_auth_mode
+    from backend.services.config import ConfigError
 
-    assert get_effective_auth_mode() == "none"
+    with pytest.raises(ConfigError):
+        get_effective_auth_mode()
 
 
 def test_credentials_from_config(config_path: Path) -> None:

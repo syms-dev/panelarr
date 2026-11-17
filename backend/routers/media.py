@@ -28,6 +28,7 @@ from backend.services.arr import (
     trigger_season_search,
 )
 from backend.services.config import get_service_config, load_config, resolve_config_path
+from backend.services.security import RASTER_IMAGE_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -291,7 +292,7 @@ async def poster_proxy(url: str, source: str | None = None) -> Response:
         return FileResponse(
             cache_path,
             media_type="image/jpeg",
-            headers={"Cache-Control": "public, max-age=604800"},  # 7 days
+            headers={"Cache-Control": "private, max-age=604800"},  # 7 days
         )
 
     # Fetch from remote
@@ -301,9 +302,9 @@ async def poster_proxy(url: str, source: str | None = None) -> Response:
         if resp.status_code != 200:
             return Response(status_code=404)
 
-        # Validate content-type is actually an image
-        content_type = resp.headers.get("content-type", "")
-        if not content_type.startswith("image/"):
+        # Raster images only (no SVG, which can carry script)
+        content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type not in RASTER_IMAGE_TYPES:
             return Response(status_code=415)
 
         # Reject oversized responses (max 10 MB)
@@ -316,7 +317,7 @@ async def poster_proxy(url: str, source: str | None = None) -> Response:
         return Response(
             content=resp.content,
             media_type=content_type,
-            headers={"Cache-Control": "public, max-age=604800"},
+            headers={"Cache-Control": "private, max-age=604800"},
         )
     except Exception:
         return Response(status_code=404)
