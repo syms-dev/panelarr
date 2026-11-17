@@ -5,6 +5,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -596,6 +597,20 @@ async def trigger_import_scan(service: str, download_id: int | None = None) -> d
         return {"ok": True, "message": f"Import refresh triggered on {service}"}
     except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
+
+
+def poster_proxy_url(raw: str, source: str | None = None) -> str:
+    """Build the frontend-facing ``/api/media/poster`` URL for an artwork URL.
+
+    The upstream URL is percent-encoded (keeping ``:`` and ``/`` readable) so
+    query characters such as ``&``, ``?`` and ``#`` survive the round trip. For
+    Arr-local relative paths (``/MediaCover/...``) the originating service is
+    passed along so the proxy can fetch it with that service's API key.
+    """
+    url = f"/api/media/poster?url={quote(raw, safe=':/')}"
+    if source and raw.startswith("/"):
+        url += f"&source={quote(source, safe='')}"
+    return url
 
 
 def _extract_poster(images: list) -> str:

@@ -7,7 +7,7 @@ from typing import Any, TypedDict
 
 import httpx
 
-from backend.services.arr import _arr_get, _is_configured
+from backend.services.arr import _arr_get, _is_configured, poster_proxy_url
 from backend.services.config import get_service_config, load_config
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ class CalendarItem(TypedDict, total=False):
     movie_id: int | None
 
 
-def _pick_poster(images: list[dict] | None) -> str | None:
+def _pick_poster(images: list[dict] | None, source: str | None = None) -> str | None:
     """Pick a poster URL from an ARR images array, wrapped in the proxy.
 
     The frontend CSP blocks external image hosts, so all artwork must be
@@ -53,7 +53,7 @@ def _pick_poster(images: list[dict] | None) -> str | None:
         raw = first.get("remoteUrl") or first.get("url")
     if not raw:
         return None
-    return f"/api/media/poster?url={raw}"
+    return poster_proxy_url(raw, source)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -79,7 +79,10 @@ def _episode_code(season: int | None, episode: int | None) -> str | None:
 
 
 def _soonest_release(movie: dict, start: datetime, end: datetime) -> tuple[datetime, str] | None:
-    """Pick the soonest release date for a Radarr movie within [start, end]."""
+    """Pick the soonest release date for a Radarr movie within [start, end).
+
+    ``end`` is exclusive, matching the calendar API contract.
+    """
     candidates: list[tuple[datetime, str]] = []
     for field, label in (
         ("inCinemas", "cinema"),
@@ -87,7 +90,7 @@ def _soonest_release(movie: dict, start: datetime, end: datetime) -> tuple[datet
         ("physicalRelease", "physical"),
     ):
         dt = _parse_iso(movie.get(field))
-        if dt is not None and start <= dt <= end:
+        if dt is not None and start <= dt < end:
             candidates.append((dt, label))
     if not candidates:
         return None
@@ -127,6 +130,9 @@ async def _fetch_sonarr_calendar(
         air = _parse_iso(ep.get("airDateUtc"))
         if air is None:
             continue
+        # Sonarr treats `end` inclusively; the contract here is [start, end)
+        if not (start <= air < end):
+            continue
         series = ep.get("series") or {}
         series_title = series.get("title") or ""
         season_num = ep.get("seasonNumber")
@@ -145,7 +151,7 @@ async def _fetch_sonarr_calendar(
                 air_date_utc=_to_utc_iso(air),
                 has_file=bool(ep.get("hasFile")),
                 monitored=bool(ep.get("monitored", True)),
-                poster_url=_pick_poster(series.get("images")),
+                poster_url=_pick_poster(series.get("images"), "sonarr"),
                 deep_link=f"/shows/{series.get('id')}" if series.get("id") else None,
                 season=season_num,
                 episode=episode_num,
@@ -196,7 +202,7 @@ async def _fetch_radarr_calendar(
                 air_date_utc=_to_utc_iso(when),
                 has_file=bool(movie.get("hasFile")),
                 monitored=bool(movie.get("monitored", True)),
-                poster_url=_pick_poster(movie.get("images")),
+                poster_url=_pick_poster(movie.get("images"), "radarr"),
                 deep_link=f"/movies/{movie.get('id')}" if movie.get("id") else None,
                 release_type=release_type,
                 movie_id=movie.get("id"),
