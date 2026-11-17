@@ -1,58 +1,55 @@
 from __future__ import annotations
 
-import re
-
 from backend.services.registry import KNOWN_SERVICES, get_service_fields
 
-IMAGE_PATTERNS: dict[str, list[re.Pattern[str]]] = {
-    "sonarr": [
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/sonarr", re.I),
-        re.compile(r"hotio/sonarr", re.I),
-        re.compile(r"^sonarr(:|$)", re.I),
-    ],
-    "radarr": [
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/radarr", re.I),
-        re.compile(r"hotio/radarr", re.I),
-        re.compile(r"^radarr(:|$)", re.I),
-    ],
-    "sabnzbd": [
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/sabnzbd", re.I),
-        re.compile(r"hotio/sabnzbd", re.I),
-        re.compile(r"^sabnzbd(:|$)", re.I),
-    ],
-    "nzbget": [
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/nzbget", re.I),
-        re.compile(r"^nzbget(:|$)", re.I),
-    ],
-    "qbittorrent": [
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/qbittorrent", re.I),
-        re.compile(r"qbittorrentofficial/qbittorrent-nox", re.I),
-        re.compile(r"binhex/arch-qbittorrent", re.I),
-        re.compile(r"^qbittorrent(:|$)", re.I),
-    ],
-    "transmission": [
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/transmission", re.I),
-        re.compile(r"^transmission(:|$)", re.I),
-    ],
-    "deluge": [
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/deluge", re.I),
-        re.compile(r"^deluge(:|$)", re.I),
-    ],
-    "plex": [
-        re.compile(r"plexinc/pms-docker", re.I),
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/plex", re.I),
-        re.compile(r"^plex(:|$)", re.I),
-    ],
-    "jellyfin": [
-        re.compile(r"jellyfin/jellyfin", re.I),
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/jellyfin", re.I),
-        re.compile(r"^jellyfin(:|$)", re.I),
-    ],
-    "emby": [
-        re.compile(r"emby/embyserver", re.I),
-        re.compile(r"(linuxserver|lscr\.io/linuxserver)/emby", re.I),
-        re.compile(r"^emby(:|$)", re.I),
-    ],
+# Known image repositories per service, as "<org>/<name>" (or a bare "<name>" for
+# official/library images). Matching is exact on the image's final two path
+# components, ignoring registry host, tag and digest, so variants such as
+# "linuxserver/plex-meta-manager" or "jellyfin/jellyfin-vue" never match.
+IMAGE_PATTERNS: dict[str, frozenset[str]] = {
+    "sonarr": frozenset({"linuxserver/sonarr", "hotio/sonarr", "sonarr"}),
+    "radarr": frozenset({"linuxserver/radarr", "hotio/radarr", "radarr"}),
+    "sabnzbd": frozenset(
+        {
+            "linuxserver/sabnzbd",
+            "hotio/sabnzbd",
+            "binhex/arch-sabnzbd",
+            "sabnzbd/sabnzbd",
+            "sabnzbd",
+        }
+    ),
+    "nzbget": frozenset(
+        {"linuxserver/nzbget", "hotio/nzbget", "binhex/arch-nzbget", "nzbget/nzbget", "nzbget"}
+    ),
+    "qbittorrent": frozenset(
+        {
+            "linuxserver/qbittorrent",
+            "hotio/qbittorrent",
+            "qbittorrentofficial/qbittorrent-nox",
+            "binhex/arch-qbittorrent",
+            "binhex/arch-qbittorrentvpn",
+            "binhex/qbittorrentvpn",
+            "qbittorrent",
+        }
+    ),
+    "transmission": frozenset(
+        {
+            "linuxserver/transmission",
+            "haugene/transmission-openvpn",
+            "binhex/arch-transmissionvpn",
+            "transmission",
+        }
+    ),
+    "deluge": frozenset(
+        {"linuxserver/deluge", "binhex/arch-delugevpn", "binhex/arch-deluge", "deluge"}
+    ),
+    "plex": frozenset(
+        {"plexinc/pms-docker", "linuxserver/plex", "hotio/plex", "binhex/arch-plex", "plex"}
+    ),
+    "jellyfin": frozenset(
+        {"jellyfin/jellyfin", "linuxserver/jellyfin", "hotio/jellyfin", "jellyfin"}
+    ),
+    "emby": frozenset({"emby/embyserver", "linuxserver/emby", "emby"}),
 }
 
 # Default ports, supplement what KNOWN_SERVICES provides
@@ -78,10 +75,22 @@ def _service_default_port(service: str) -> int | None:
     return info.get("default_port") or DEFAULT_PORTS.get(service)
 
 
+def _image_repo_key(image: str) -> str:
+    """Return the lowercased ``org/name`` (or bare ``name``) of an image reference.
+
+    The registry host, tag and digest are stripped, so ``lscr.io/linuxserver/sonarr:4``
+    and ``linuxserver/sonarr`` both yield ``linuxserver/sonarr``.
+    """
+    ref = image.strip().lower().split("@", 1)[0]
+    if ":" in ref.rsplit("/", 1)[-1]:
+        ref = ref.rsplit(":", 1)[0]
+    parts = [p for p in ref.split("/") if p]
+    return "/".join(parts[-2:])
+
+
 def _image_matches(image: str, service: str) -> bool:
-    """Return True if the container image matches any pattern for the service."""
-    patterns = IMAGE_PATTERNS.get(service, [])
-    return any(p.search(image) for p in patterns)
+    """Return True if the container image is exactly a known image of the service."""
+    return _image_repo_key(image) in IMAGE_PATTERNS.get(service, frozenset())
 
 
 def match_container(container: dict) -> tuple[str, str] | None:
@@ -136,20 +145,12 @@ def match_container(container: dict) -> tuple[str, str] | None:
 def suggested_url(container: dict, service: str) -> str:
     """Build the suggested URL for a service.
 
-    Uses container name as Docker DNS hostname and the service's default port.
-    If the container exposes a non-default port mapping, prefer that host port.
+    The URL is meant for Panelarr reaching the container over the Docker network,
+    so it uses the container name as DNS hostname and the container's INTERNAL
+    port. A host-published port (``18989:8989``) is irrelevant on that network.
     """
     name: str = container.get("name", "").lstrip("/")
-    ports: dict = container.get("ports", {})
     default_port = _service_default_port(service) or 80
-
-    # Check if the service port is exposed under a different host port
-    port_key = f"{default_port}/tcp"
-    if port_key in ports and isinstance(ports[port_key], int):
-        exposed_port = ports[port_key]
-        if exposed_port != default_port:
-            return f"http://{name}:{exposed_port}"
-
     return f"http://{name}:{default_port}"
 
 

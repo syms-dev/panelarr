@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -13,14 +17,34 @@ logger = logging.getLogger(__name__)
 API_TIMEOUT = 15
 
 
+class InvalidResponseError(httpx.HTTPError):
+    """Raised when a service answers 2xx but the body is not the expected JSON."""
+
+
+def _json_or_raise(resp: httpx.Response) -> Any:
+    """Decode a JSON response body, raising InvalidResponseError on bad payloads.
+
+    Typical cause: a wrong URL/base path that lands on an HTML login or error
+    page which still returns 200.
+    """
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise InvalidResponseError("Response was not valid JSON") from exc
+
+
 def _safe_error(exc: Exception) -> str:
     """Return a safe error message that never includes URLs or query params."""
+    if isinstance(exc, InvalidResponseError):
+        return "Invalid response (not JSON), check the service URL"
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code}"
     if isinstance(exc, httpx.ConnectError):
         return "Connection refused or unreachable"
     if isinstance(exc, httpx.TimeoutException):
         return "Request timed out"
+    if isinstance(exc, httpx.TransportError):
+        return "Connection error"
     return type(exc).__name__
 
 
@@ -62,7 +86,7 @@ async def _arr_get(
         timeout=timeout,
     )
     resp.raise_for_status()
-    return resp.json()
+    return _json_or_raise(resp)
 
 
 async def _arr_post(url: str, api_key: str, path: str, body: dict | None = None) -> dict:
@@ -74,7 +98,7 @@ async def _arr_post(url: str, api_key: str, path: str, body: dict | None = None)
         json=body or {},
     )
     resp.raise_for_status()
-    return resp.json()
+    return _json_or_raise(resp)
 
 
 async def _arr_delete(url: str, api_key: str, path: str, params: dict | None = None) -> dict | None:
@@ -86,7 +110,10 @@ async def _arr_delete(url: str, api_key: str, path: str, params: dict | None = N
         params=params,
     )
     if resp.status_code == 200:
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError:
+            return None  # DELETE bodies are optional; success is the status code
     resp.raise_for_status()
     return None
 
@@ -104,7 +131,7 @@ async def get_arr_status(service_name: str) -> dict:
         return {"configured": False}
     try:
         return await _arr_get(url, api_key, "/api/v3/system/status")
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("%s status error: %s", service_name, exc)
         return {"configured": True, "error": _safe_error(exc)}
 
@@ -136,7 +163,7 @@ async def get_arr_queue(service_name: str) -> dict:
             )
         result = await _arr_get(url, api_key, "/api/v3/queue", params=params)
         return result if isinstance(result, dict) else {"records": result}
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("%s queue error: %s", service_name, exc)
         return {"configured": True, "error": _safe_error(exc), "records": []}
 
@@ -180,7 +207,7 @@ async def delete_queue_item(
             },
         )
         return {"ok": True}
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
 
 
@@ -202,7 +229,8 @@ async def get_sabnzbd_stats() -> dict:
             },
         )
         resp.raise_for_status()
-        data = resp.json().get("queue", {})
+        payload = _json_or_raise(resp)
+        data = payload.get("queue", {}) if isinstance(payload, dict) else {}
         return {
             "configured": True,
             "queue": int(data.get("noofslots_total", 0)),
@@ -210,9 +238,68 @@ async def get_sabnzbd_stats() -> dict:
             "size_left": data.get("sizeleft", "0 B"),
             "status": data.get("status", "Idle"),
         }
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("SABnzbd stats error: %s", exc)
         return {"configured": True, "error": _safe_error(exc)}
+
+
+def _qbit_login_ok(resp: httpx.Response) -> bool:
+    """Interpret a qBittorrent ``/auth/login`` response.
+
+    qBittorrent <= 5.0 answers ``200`` with ``Ok.``; 5.1+ answers ``204`` with an
+    empty body. ``Fails.`` / 401 / 403 mean the credentials were rejected.
+    """
+    if resp.status_code in (401, 403):
+        return False
+    text = resp.text.strip()
+    if text == "Fails.":
+        return False
+    if resp.status_code == 200 and text == "Ok.":
+        return True
+    return 200 <= resp.status_code < 300 and not text
+
+
+# qBittorrent 5.0 renamed pause/resume to stop/start. Cache which flavour each
+# instance speaks so we only pay the 404 fallback once.
+_qbit_uses_stop_start: dict[str, bool] = {}
+
+QBIT_PAUSED_STATES = frozenset({"pausedUP", "pausedDL", "stoppedUP", "stoppedDL"})
+QBIT_PAUSED_SEEDING_STATES = frozenset({"pausedUP", "stoppedUP"})
+
+
+class _QbitSession:
+    """Logged-in qBittorrent client that re-authenticates once on 403."""
+
+    def __init__(self, client: httpx.AsyncClient, url: str, username: str, password: str) -> None:
+        self._client = client
+        self._url = url
+        self._username = username
+        self._password = password
+
+    async def login(self) -> bool:
+        """Authenticate; return True on success."""
+        resp = await self._client.post(
+            f"{self._url}/api/v2/auth/login",
+            data={"username": self._username, "password": self._password},
+        )
+        if not _qbit_login_ok(resp):
+            return False
+        self._client.cookies.update(resp.cookies)
+        return True
+
+    async def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Send a request, logging in again once if the session expired (403)."""
+        resp = await self._client.request(method, f"{self._url}{path}", **kwargs)
+        if resp.status_code == 403 and await self.login():
+            resp = await self._client.request(method, f"{self._url}{path}", **kwargs)
+        return resp
+
+
+@asynccontextmanager
+async def _qbit_session(url: str, username: str, password: str) -> AsyncIterator[_QbitSession]:
+    """Yield a ``_QbitSession`` backed by a short-lived HTTP client."""
+    async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+        yield _QbitSession(client, url, username, password)
 
 
 async def get_qbittorrent_stats() -> dict:
@@ -220,50 +307,29 @@ async def get_qbittorrent_stats() -> dict:
     config = load_config()
     svc = get_service_config(config, "qbittorrent")
     url = svc.get("url", "")
-    username = svc.get("username", "")
-    password = svc.get("password", "")
     if not url:
         return {"configured": False}
     try:
-        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-            login_resp = await client.post(
-                f"{url}/api/v2/auth/login",
-                data={"username": username, "password": password},
-            )
-            if login_resp.text != "Ok.":
+        async with _qbit_session(url, svc.get("username", ""), svc.get("password", "")) as qb:
+            if not await qb.login():
                 return {"configured": True, "error": "Authentication failed"}
 
-            cookies = login_resp.cookies
-            info_resp = await client.get(
-                f"{url}/api/v2/transfer/info",
-                cookies=cookies,
-            )
+            info_resp = await qb.request("GET", "/api/v2/transfer/info")
             info_resp.raise_for_status()
-            info = info_resp.json()
+            info = _json_or_raise(info_resp)
 
             dl_resp, seed_resp = await asyncio.gather(
-                client.get(
-                    f"{url}/api/v2/torrents/info",
-                    params={"filter": "downloading"},
-                    cookies=cookies,
-                ),
-                client.get(
-                    f"{url}/api/v2/torrents/info",
-                    params={"filter": "seeding"},
-                    cookies=cookies,
-                ),
+                qb.request("GET", "/api/v2/torrents/info", params={"filter": "downloading"}),
+                qb.request("GET", "/api/v2/torrents/info", params={"filter": "seeding"}),
             )
-            downloading = dl_resp.json() if dl_resp.status_code == 200 else []
-            seeding = seed_resp.json() if seed_resp.status_code == 200 else []
+            downloading = _json_or_raise(dl_resp) if dl_resp.status_code == 200 else []
+            seeding = _json_or_raise(seed_resp) if seed_resp.status_code == 200 else []
 
             # Detect VPN via network interface binding
             vpn_interface = ""
             vpn_active = False
             try:
-                prefs_resp = await client.get(
-                    f"{url}/api/v2/app/preferences",
-                    cookies=cookies,
-                )
+                prefs_resp = await qb.request("GET", "/api/v2/app/preferences")
                 if prefs_resp.status_code == 200:
                     prefs = prefs_resp.json()
                     iface = prefs.get("current_interface_name", "")
@@ -286,34 +352,34 @@ async def get_qbittorrent_stats() -> dict:
                 "vpn_active": vpn_active,
                 "vpn_interface": vpn_interface,
             }
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("qBittorrent stats error: %s", exc)
         return {"configured": True, "error": _safe_error(exc)}
 
 
 async def get_qbittorrent_torrents(filter_type: str = "seeding") -> dict:
-    """Get torrent list from qBittorrent for UI display."""
+    """Get torrent list from qBittorrent for UI display.
+
+    The ``paused`` filter is resolved client-side (all torrents filtered by
+    state) because qBittorrent 5.x renamed ``paused`` to ``stopped``.
+    """
     config = load_config()
     svc = get_service_config(config, "qbittorrent")
     url = svc.get("url", "")
-    username = svc.get("username", "")
-    password = svc.get("password", "")
     if not url:
         return {"configured": False, "torrents": []}
     try:
-        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-            login_resp = await client.post(
-                f"{url}/api/v2/auth/login",
-                data={"username": username, "password": password},
-            )
-            if login_resp.text != "Ok.":
+        async with _qbit_session(url, svc.get("username", ""), svc.get("password", "")) as qb:
+            if not await qb.login():
                 return {"configured": True, "error": "Auth failed", "torrents": []}
-            resp = await client.get(
-                f"{url}/api/v2/torrents/info",
-                params={"filter": filter_type},
-                cookies=login_resp.cookies,
-            )
+            params = {} if filter_type == "paused" else {"filter": filter_type}
+            resp = await qb.request("GET", "/api/v2/torrents/info", params=params)
             resp.raise_for_status()
+            rows = _json_or_raise(resp)
+            if not isinstance(rows, list):
+                raise InvalidResponseError("Unexpected torrent list payload")
+            if filter_type == "paused":
+                rows = [t for t in rows if t.get("state") in QBIT_PAUSED_STATES]
             torrents = [
                 {
                     "hash": t["hash"],
@@ -324,52 +390,54 @@ async def get_qbittorrent_torrents(filter_type: str = "seeding") -> dict:
                     "up_speed": t.get("upspeed", 0),
                     "ratio": t.get("ratio", 0),
                 }
-                for t in resp.json()
+                for t in rows
             ]
             return {"configured": True, "torrents": torrents}
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         return {"configured": True, "error": _safe_error(exc), "torrents": []}
 
 
 async def qbittorrent_torrent_action(action: str, hashes: list[str]) -> dict:
-    """Perform an action on qBittorrent torrents (pause/resume/delete)."""
+    """Perform an action on qBittorrent torrents (pause/resume/delete).
+
+    ``pause``/``resume`` use qBittorrent 5.x ``stop``/``start`` and fall back to
+    the legacy endpoints on 404.
+    """
     config = load_config()
     svc = get_service_config(config, "qbittorrent")
     url = svc.get("url", "")
-    username = svc.get("username", "")
-    password = svc.get("password", "")
     if not url:
         return {"ok": False, "message": "qBittorrent not configured"}
 
-    action_map = {
-        "pause": "/api/v2/torrents/pause",
-        "resume": "/api/v2/torrents/resume",
-        "delete": "/api/v2/torrents/delete",
-    }
-    if action not in action_map:
+    if action not in ("pause", "resume", "delete"):
         return {"ok": False, "message": f"Unknown action: {action}"}
 
     try:
-        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-            login_resp = await client.post(
-                f"{url}/api/v2/auth/login",
-                data={"username": username, "password": password},
-            )
-            if login_resp.text != "Ok.":
+        async with _qbit_session(url, svc.get("username", ""), svc.get("password", "")) as qb:
+            if not await qb.login():
                 return {"ok": False, "message": "Authentication failed"}
 
             data: dict[str, str] = {"hashes": "|".join(hashes)}
             if action == "delete":
                 data["deleteFiles"] = "false"
-
-            resp = await client.post(
-                f"{url}{action_map[action]}",
-                data=data,
-                cookies=login_resp.cookies,
-            )
+                resp = await qb.request("POST", "/api/v2/torrents/delete", data=data)
+            else:
+                new, old = (
+                    ("/api/v2/torrents/stop", "/api/v2/torrents/pause")
+                    if action == "pause"
+                    else ("/api/v2/torrents/start", "/api/v2/torrents/resume")
+                )
+                order = [old, new] if _qbit_uses_stop_start.get(url) is False else [new, old]
+                resp = await qb.request("POST", order[0], data=data)
+                used = order[0]
+                if resp.status_code == 404:
+                    resp = await qb.request("POST", order[1], data=data)
+                    used = order[1]
+                if resp.status_code < 400:
+                    _qbit_uses_stop_start[url] = used == new
             resp.raise_for_status()
             return {"ok": True}
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
 
 
@@ -430,7 +498,7 @@ async def get_arr_tasks(service_name: str) -> list[dict]:
                 }
             )
         return tasks
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("%s tasks error: %s", service_name, exc)
         return []
 
@@ -505,7 +573,7 @@ async def get_arr_history(service_name: str, limit: int = 30) -> list[dict]:
             if len(results) >= 10:
                 break
         return results
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("%s history error: %s", service_name, exc)
         return []
 
@@ -527,8 +595,22 @@ async def trigger_import_scan(service: str, download_id: int | None = None) -> d
         # imports for any that are completed. No path parameter needed.
         await _arr_post(url, api_key, "/api/v3/command", {"name": "RefreshMonitoredDownloads"})
         return {"ok": True, "message": f"Import refresh triggered on {service}"}
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
+
+
+def poster_proxy_url(raw: str, source: str | None = None) -> str:
+    """Build the frontend-facing ``/api/media/poster`` URL for an artwork URL.
+
+    The upstream URL is percent-encoded (keeping ``:`` and ``/`` readable) so
+    query characters such as ``&``, ``?`` and ``#`` survive the round trip. For
+    Arr-local relative paths (``/MediaCover/...``) the originating service is
+    passed along so the proxy can fetch it with that service's API key.
+    """
+    url = f"/api/media/poster?url={quote(raw, safe=':/')}"
+    if source and raw.startswith("/"):
+        url += f"&source={quote(source, safe='')}"
+    return url
 
 
 def _extract_poster(images: list) -> str:
@@ -596,7 +678,7 @@ async def get_radarr_movies() -> list[dict]:
                 }
             )
         return movies
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("Radarr movies error: %s", exc)
         return []
 
@@ -668,7 +750,7 @@ async def get_sonarr_series() -> list[dict]:
                 }
             )
         return series
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("Sonarr series error: %s", exc)
         return []
 
@@ -810,7 +892,7 @@ async def get_sonarr_series_detail(series_id: int) -> dict:
             "banner": _extract_image(series_data.get("images", []), "banner"),
             "seasons": seasons,
         }
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("Sonarr series detail error: %s", exc)
         return {}
 
@@ -881,7 +963,7 @@ async def get_radarr_movie_detail(movie_id: int) -> dict:
             "fanart": _extract_image(data.get("images", []), "fanart"),
             "movieFile": movie_file,
         }
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("Radarr movie detail error: %s", exc)
         return {}
 
@@ -927,11 +1009,7 @@ async def get_quality_profiles(
         if not isinstance(data, list):
             return []
         return [{"id": p.get("id"), "name": p.get("name", "")} for p in data]
-    except (
-        httpx.ConnectError,
-        httpx.TimeoutException,
-        httpx.HTTPStatusError,
-    ):
+    except httpx.HTTPError:
         return []
 
 
@@ -966,7 +1044,7 @@ async def search_movies(query: str) -> list[dict]:
                 }
             )
         return results
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("Movie search error: %s", exc)
         return []
 
@@ -1028,7 +1106,7 @@ async def add_movie(tmdb_id: int, quality_profile_id: int = 0) -> dict[str, obje
                 msg = _safe_error(exc)
             return {"ok": False, "message": msg}
         return {"ok": False, "message": f"HTTP {exc.response.status_code}"}
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+    except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
 
 
@@ -1066,7 +1144,7 @@ async def search_shows(query: str) -> list[dict]:
                 }
             )
         return results
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("Show search error: %s", exc)
         return []
 
@@ -1137,7 +1215,7 @@ async def add_show(tvdb_id: int, quality_profile_id: int = 0) -> dict[str, objec
                 msg = _safe_error(exc)
             return {"ok": False, "message": msg}
         return {"ok": False, "message": f"HTTP {exc.response.status_code}"}
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+    except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
 
 
@@ -1156,11 +1234,7 @@ async def trigger_search_missing(service: str, series_id: int) -> dict[str, obje
             {"name": "SeriesSearch", "seriesId": series_id},
         )
         return {"ok": True, "message": "Searching for missing episodes"}
-    except (
-        httpx.ConnectError,
-        httpx.TimeoutException,
-        httpx.HTTPStatusError,
-    ) as exc:
+    except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
 
 
@@ -1189,11 +1263,7 @@ async def trigger_season_search(
             "ok": True,
             "message": f"Searching season {season_number}",
         }
-    except (
-        httpx.ConnectError,
-        httpx.TimeoutException,
-        httpx.HTTPStatusError,
-    ) as exc:
+    except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
 
 
@@ -1219,11 +1289,7 @@ async def trigger_episode_search(
             "ok": True,
             "message": f"Searching {count} {label}",
         }
-    except (
-        httpx.ConnectError,
-        httpx.TimeoutException,
-        httpx.HTTPStatusError,
-    ) as exc:
+    except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
 
 
@@ -1242,9 +1308,5 @@ async def trigger_movie_search(movie_id: int) -> dict[str, object]:
             {"name": "MoviesSearch", "movieIds": [movie_id]},
         )
         return {"ok": True, "message": "Search started for movie"}
-    except (
-        httpx.ConnectError,
-        httpx.TimeoutException,
-        httpx.HTTPStatusError,
-    ) as exc:
+    except httpx.HTTPError as exc:
         return {"ok": False, "message": _safe_error(exc)}
