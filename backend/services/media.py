@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import quote
 
 import httpx
 
@@ -114,7 +115,7 @@ async def get_plex_stats() -> dict:
                 stream = _parse_plex_session(metadata)
                 # Use proxy URL to avoid exposing Plex token to the browser
                 if stream["thumb"]:
-                    encoded_path = stream["thumb"]
+                    encoded_path = quote(stream["thumb"], safe="")
                     stream["thumb_url"] = f"/api/system/plex/thumb?path={encoded_path}"
                 else:
                     stream["thumb_url"] = None

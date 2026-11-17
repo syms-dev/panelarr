@@ -23,6 +23,69 @@ Panelarr uses [Semantic Versioning](https://semver.org):
 
 Minor alpha bumps (`0.2.0-alpha`, `0.3.0-alpha`, etc.) happen on meaningful milestones between now and beta.
 
+## [Unreleased]
+
+Fixes from a full audit (unit, e2e and live penetration testing) of 0.3.1-alpha.
+
+### Security
+
+- **Corrupt `panelarr.json` no longer disables authentication.** Previously
+  a parse error fell back to defaults (auth `none`, wizard reopened) and the
+  next save overwrote the real file. The API now answers 503 until the file
+  is fixed, keeps the last valid config if it breaks at runtime, and moves a
+  broken file to `panelarr.json.corrupt-<timestamp>` before saving over it.
+- **Proxy auth mode actually authenticates.** The header is required and is
+  only honoured from trusted proxy addresses (`auth.trusted_proxies`,
+  `PANELARR_TRUSTED_PROXIES`; default loopback + `172.16.0.0/12`). Switching
+  to proxy mode is refused unless the request proves the proxy works.
+- **Setup wizard can't be hijacked.** Before the auth step only the wizard is
+  reachable; after it, the wizard needs the new credentials (the auth step
+  signs you in). Re-running the wizard no longer opens it to anyone.
+- **No wildcard CORS**; writes and log WebSockets from other origins
+  (including sibling subdomains) are refused.
+- **Sessions**: logout revokes the token, credential or API-key changes sign
+  out other sessions, cookies are `SameSite=Strict`, login is constant-time
+  and rate-limited per real client IP.
+- **Secrets**: a stored key or password is never sent to a changed URL or
+  mail server; notification secrets (SMTP password, webhook URLs, bot
+  tokens) are masked in every response.
+- **Outbound requests** resolve hostnames and refuse cloud metadata,
+  link-local addresses and the Docker API, while LAN webhooks (ntfy, Gotify)
+  now work.
+- Panelarr won't stop or recreate its own container or its socket proxy.
+  Self-update pins its helper image and keeps env vars out of its command line.
+- API docs moved behind auth to `/api/docs`; new public `/api/healthz` for the
+  container healthcheck (previously "unhealthy" whenever auth was on).
+
+### Fixed
+
+- qBittorrent 5.x: login (204 response), stop/start actions, stopped states;
+  paused torrents stay listed with Resume.
+- API-key mode no longer locks the browser out (sign in once with the key);
+  basic auth chosen in the wizard no longer bounces to `/login` mid-wizard;
+  "Re-run setup wizard" works; the thresholds step keeps the disk selection.
+- Image update checks work for ghcr.io/lscr.io/Docker Hub (registry token
+  flow), digest-pinned images are reported as pinned, failed pulls are
+  reported instead of "Updated", and update badges no longer vanish (cached
+  results instead of 429).
+- Self-update works through a TCP socket proxy, can move a pinned version
+  tag forward, preserves mounts/devices/security options, and rolls back if
+  the new container fails to start.
+- Log streams: correct close codes, no reconnect storm, no leaked streams.
+- Discovery suggests the container's internal port and no longer matches
+  look-alike images; hotio/binhex variants added.
+- Calendar: last day of the month and timezone edges no longer dropped; air
+  dates no longer shown a day early in the Americas; the ICS feed has a
+  subscribe URL with a token.
+- Delete/blocklist/qBit actions report failures; the poster cache follows the
+  config directory; container label links only allow http(s); keyboard
+  activation of link buttons; logout leaves the dashboard immediately.
+
+### Added
+
+- Security regression suite (`backend/tests/test_security.py`) and a
+  Playwright e2e suite (`frontend/e2e`, CI job `E2E`).
+
 ## [0.1.0-alpha] - Unreleased
 
 ### Removed

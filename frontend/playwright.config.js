@@ -47,7 +47,7 @@ export default defineConfig({
   webServer: {
     command: `${process.env.PANELARR_PYTHON || "python"} -m uvicorn backend.main:app --host 127.0.0.1 --port ${PORT}`,
     cwd: repoRoot,
-    url: `http://127.0.0.1:${PORT}/api/auth/status`,
+    url: `http://127.0.0.1:${PORT}/api/healthz`,
     reuseExistingServer: false,
     timeout: 60_000,
     env: {
