@@ -25,12 +25,12 @@ from backend.routers import (
 from backend.services.arr import close_http_client
 from backend.services.auth import authenticate
 from backend.services.auth_config import (
+    backfill_legacy_setup,
     get_effective_auth_mode,
-    get_or_create_calendar_token,
     is_auth_configured,
 )
 from backend.services.config import ConfigError, load_config
-from backend.services.security import is_state_changing, origin_allowed
+from backend.services.security import host_allowed, is_state_changing, origin_allowed
 
 _log = logging.getLogger("panelarr.startup")
 
@@ -42,6 +42,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         try:
             load_config()
+            backfill_legacy_setup()
             if is_auth_configured() and get_effective_auth_mode() == "none":
                 _log.warning(
                     "Panelarr is running without authentication. "
@@ -103,7 +104,10 @@ def _calendar_token_ok(request: Request) -> bool:
     provided = request.query_params.get("token", "")
     if not provided:
         return False
-    expected = get_or_create_calendar_token()
+    # Read only: an unauthenticated request must never create the token.
+    expected = (load_config().auth or {}).get("calendar_token", "")
+    if not expected:
+        return False
     return secrets.compare_digest(provided.encode(), expected.encode())
 
 
@@ -118,6 +122,9 @@ async def auth_middleware(request: Request, call_next):
     if not path.startswith("/api/"):
         # SPA shell and static assets; the frontend handles redirects.
         return await call_next(request)
+
+    if not host_allowed(request):
+        return JSONResponse(status_code=421, content={"detail": "Unknown host"})
 
     if is_state_changing(request.method) and not origin_allowed(request):
         return JSONResponse(status_code=403, content={"detail": "Cross-origin request refused"})

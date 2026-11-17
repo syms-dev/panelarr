@@ -36,8 +36,10 @@ Fixes from a full audit (unit, e2e and live penetration testing) of 0.3.1-alpha.
   broken file to `panelarr.json.corrupt-<timestamp>` before saving over it.
 - **Proxy auth mode actually authenticates.** The header is required and is
   only honoured from trusted proxy addresses (`auth.trusted_proxies`,
-  `PANELARR_TRUSTED_PROXIES`; default loopback + `172.16.0.0/12`). Switching
-  to proxy mode is refused unless the request proves the proxy works.
+  `PANELARR_TRUSTED_PROXIES`; default localhost only). Switching to proxy
+  mode is refused unless the request proves the proxy works, and then trusts
+  exactly that proxy address. **Existing proxy-mode users:** open Panelarr
+  through your proxy and re-save proxy mode, or set `PANELARR_TRUSTED_PROXIES`.
 - **Setup wizard can't be hijacked.** Before the auth step only the wizard is
   reachable; after it, the wizard needs the new credentials (the auth step
   signs you in). Re-running the wizard no longer opens it to anyone.
@@ -54,6 +56,9 @@ Fixes from a full audit (unit, e2e and live penetration testing) of 0.3.1-alpha.
   now work.
 - Panelarr won't stop or recreate its own container or its socket proxy.
   Self-update pins its helper image and keeps env vars out of its command line.
+- Optional `PANELARR_ALLOWED_HOSTS` host allowlist against DNS rebinding.
+  Self-update refuses downgrades. The legacy-install migration only runs at
+  startup, so a request can no longer mark a fresh install as set up.
 - API docs moved behind auth to `/api/docs`; new public `/api/healthz` for the
   container healthcheck (previously "unhealthy" whenever auth was on).
 

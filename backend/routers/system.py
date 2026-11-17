@@ -11,7 +11,7 @@ from importlib.metadata import version as pkg_version
 
 import httpx
 import psutil
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -503,6 +503,13 @@ async def self_update_endpoint(body: SelfUpdateRequest | None = None) -> dict:
     from backend.services.docker import self_update
 
     target = body.version if body else None
+    if target is not None and _parse_semver(target.lstrip("v")) < _parse_semver(
+        pkg_version("panelarr")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Refusing to downgrade; pull an older image manually if you really need one",
+        )
     if target is None:
         check = await version_check()
         if check.get("update_available"):

@@ -16,6 +16,7 @@ A handful of values need to be available before `panelarr.json` can be read, so 
 | `CONFIG_PATH` | `/config/panelarr.json` | Store the config file elsewhere |
 | `PANELARR_TRUSTED_PROXIES` | (unset) | Comma-separated CIDRs that may set the proxy auth header and `X-Forwarded-*`. Overrides the list saved in Settings. See [proxy](#proxy) |
 | `PANELARR_ALLOWED_ORIGINS` | (unset) | Extra browser origins allowed to make changes, e.g. when a proxy rewrites `Host`. See [Cross-origin requests](#cross-origin-requests) |
+| `PANELARR_ALLOWED_HOSTS` | (unset) | Comma-separated hostnames/IPs Panelarr answers to; anything else gets `421`. Recommended in auth mode `none` to stop DNS-rebinding attacks from web pages |
 
 Set them under `environment:` in `docker-compose.yml`:
 
@@ -167,7 +168,7 @@ No authentication. Every endpoint is open to anyone who can reach the port. Only
 
 ### basic
 
-Built-in username/password with JWT session cookies (`HttpOnly`, `SameSite=Strict`, `Secure` when served over HTTPS). Login page at `/login`. Sessions last 24 hours. Signing out revokes the session, and changing the username, password or API key signs out every other session. The signing secret is generated on first start and saved to `auth.secret` in `panelarr.json`.
+Built-in username/password with JWT session cookies (`HttpOnly`, `SameSite=Strict`, `Secure` when served over HTTPS). Login page at `/login`. Sessions last 24 hours. Signing out revokes the session (recorded in `panelarr.json`, so it survives restarts), and changing the username, password or API key signs out every other session. The signing secret is generated on first start and saved to `auth.secret` in `panelarr.json`.
 
 Login attempts are limited to 10 per minute per client address (per /64 for IPv6).
 
@@ -175,9 +176,11 @@ Login attempts are limited to 10 per minute per client address (per /64 for IPv6
 
 Trusts a header set by an authenticating reverse proxy (Authelia, Authentik, oauth2-proxy and so on) and reads the username from it.
 
-The header is only honoured when the request comes **directly from a trusted proxy address**. Anyone who can reach port 8000 directly could otherwise send the header themselves. The default trusted list is `127.0.0.1/32`, `::1/128` and `172.16.0.0/12` (Docker's default bridge networks, where Traefik usually runs). Edit it under Settings → Authentication, or pin it with `PANELARR_TRUSTED_PROXIES`. If your LAN itself uses `172.16.0.0/12`, narrow the list to your proxy's Docker network, and don't publish port 8000 at all.
+The header is only honoured when the request comes **directly from a trusted proxy address**. Anyone who can reach port 8000 directly could otherwise send the header themselves. By default only localhost is trusted. Whole Docker networks are deliberately *not* trusted by default: when a port is published, Docker's userland proxy makes every client appear to come from the network's gateway address.
 
-Panelarr refuses to switch to proxy mode unless the request making the change already carries the header from a trusted address, so you can't lock yourself out by enabling it without a working proxy. The wizard auto-detects common providers and suggests the right header name.
+To enable proxy mode, open Panelarr **through your proxy** and pick proxy mode in the wizard or Settings. Panelarr refuses unless that request carries the header, so you can't lock yourself out, and it adds the exact address the request came from (your proxy, e.g. `172.19.0.9/32`) to the trusted list. Edit the list under Settings → Authentication, or pin it with `PANELARR_TRUSTED_PROXIES` (which overrides the saved list and is the way back in if your proxy's address changes). An invalid list trusts nothing.
+
+If your proxy's container address changes when it is recreated, give it a static IP on its Docker network, or trust its network CIDR and **don't publish port 8000**. Requests carrying the header from an untrusted address are logged with that address to make this easy to diagnose. The wizard auto-detects common providers and suggests the right header name.
 
 Common headers:
 
@@ -193,7 +196,7 @@ Common headers:
 
 Every API request needs an `X-Api-Key` header. The key is shown once when it is generated; rotate it under Settings → Authentication or with `POST /api/auth/apikey/regenerate`. In the browser, the login page asks for the key once and then uses a session cookie, because browsers can't add headers to page loads or WebSockets.
 
-An `X-Api-Key` header is also accepted in every other mode, which is what dashboards like Homepage should use.
+An `X-Api-Key` header is also accepted in every other mode, which is what dashboards like Homepage should use. The key stays valid when you switch modes, so regenerate it if it may have leaked.
 
 ### Cross-origin requests
 

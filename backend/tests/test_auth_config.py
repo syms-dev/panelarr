@@ -172,8 +172,11 @@ def test_setup_backfill_with_services(config_path: Path) -> None:
 
     svc_cfg._config_cache = None
 
-    from backend.services.auth_config import is_setup_complete
+    from backend.services.auth_config import backfill_legacy_setup, is_setup_complete
 
+    # Reading never migrates; only the startup backfill does.
+    assert is_setup_complete() is False
+    assert backfill_legacy_setup() is True
     assert is_setup_complete() is True
 
     # Verify the flag was written

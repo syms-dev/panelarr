@@ -168,41 +168,41 @@ def is_auth_configured() -> bool:
 
 
 def is_setup_complete() -> bool:
-    """True iff config['setup']['completed_at'] is set.
+    """True iff config['setup']['completed_at'] is set. Never writes."""
+    from backend.services.config import load_config
 
-    Backfill: only on the *first observation* of a *legacy* install
-    (setup dict is empty, services are already configured, AND the wizard
-    has not started writing the auth block) do we auto-write
-    setup.completed_at = 'auto-migrated' so existing users skip the wizard.
+    config = load_config()
+    setup: dict = config.setup if config.setup else {}  # type: ignore[assignment]
+    return bool(setup.get("completed_at"))
 
-    The auth-block check is what distinguishes a legacy install from a
-    wizard mid-flight: the wizard always writes auth before services, so
-    once `auth.mode` is present we know we're inside an active wizard and
-    must not short-circuit it. After a reset, setup contains a 'reset_at'
-    sentinel which also prevents re-backfilling.
+
+def backfill_legacy_setup() -> bool:
+    """Mark a pre-wizard install as set up. Call once at startup only.
+
+    A legacy install (services configured, no ``setup`` block, no auth mode)
+    predates the wizard and must not be sent back through it. This runs from
+    the app lifespan, before any request is served, so it only ever looks at
+    the config file as it existed when the process started. Running it from a
+    request path would let an unauthenticated client on a fresh install save
+    a service and have the instance "auto-migrated" into auth mode none.
+    After a reset, ``setup`` holds a 'reset_at' sentinel, which also prevents
+    backfilling.
     """
     from backend.services.config import PanelarrConfig, load_config, save_config
 
     config = load_config()
     setup: dict = config.setup if config.setup else {}  # type: ignore[assignment]
-
-    if setup.get("completed_at"):
-        return True
-
     auth_block: dict = config.auth if config.auth else {}  # type: ignore[assignment]
-    wizard_in_progress = bool(auth_block.get("mode"))
-
-    if not setup and config.services and not wizard_in_progress:
-        logger.info(
-            "Backfilling setup.completed_at for existing installation (%d service(s) configured)",
-            len(config.services),
-        )
-        data = config.model_dump()
-        data["setup"] = {"completed_at": "auto-migrated", "version": VERSION}
-        save_config(PanelarrConfig(**data))
-        return True
-
-    return False
+    if setup or not config.services or auth_block.get("mode"):
+        return False
+    logger.info(
+        "Backfilling setup.completed_at for existing installation (%d service(s) configured)",
+        len(config.services),
+    )
+    data = config.model_dump()
+    data["setup"] = {"completed_at": "auto-migrated", "version": VERSION}
+    save_config(PanelarrConfig(**data))
+    return True
 
 
 def mark_setup_complete() -> None:
