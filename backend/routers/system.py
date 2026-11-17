@@ -325,10 +325,11 @@ async def discord_health_check() -> dict:
         ],
     }
 
-    from backend.services.notifications import _is_safe_url
+    from backend.services.security import check_outbound_url
 
-    if not _is_safe_url(webhook_url):
-        return {"ok": False, "message": "Webhook URL blocked by security policy"}
+    blocked = await check_outbound_url(webhook_url)
+    if blocked:
+        return {"ok": False, "message": f"Webhook URL blocked: {blocked}"}
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
