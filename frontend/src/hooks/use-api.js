@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch } from "@/lib/api";
 import { toastManager } from "@/components/ui/toast";
 
@@ -90,10 +90,14 @@ export function useQbitAction() {
         method: "POST",
         body: { action, hashes },
       }),
-    onSuccess: () => {
+    onSuccess: (result) => {
+      if (result && result.ok === false) {
+        showToast("error", "Torrent action failed", result.message);
+      }
       qc.invalidateQueries({ queryKey: ["qbit-torrents"] });
       qc.invalidateQueries({ queryKey: ["download-stats"] });
     },
+    onError: (err) => showToast("error", "Torrent action failed", err.message),
   });
 }
 
@@ -102,8 +106,12 @@ export function useDeleteDownload() {
   return useMutation({
     mutationFn: ({ source, id }) =>
       apiFetch(`/downloads/queue/${source}/${id}`, { method: "DELETE" }),
-    onSuccess: () => {
-      showToast("success", "Removed from queue");
+    onSuccess: (result) => {
+      if (result && result.ok === false) {
+        showToast("error", "Failed to remove", result.message);
+      } else {
+        showToast("success", "Removed from queue");
+      }
       qc.invalidateQueries({ queryKey: ["downloads"] });
       qc.invalidateQueries({ queryKey: ["download-stats"] });
     },
@@ -116,8 +124,12 @@ export function useBlocklistDownload() {
   return useMutation({
     mutationFn: ({ source, id }) =>
       apiFetch(`/downloads/queue/${source}/${id}/blocklist`, { method: "POST" }),
-    onSuccess: () => {
-      showToast("success", "Blocklisted and searching for new release");
+    onSuccess: (result) => {
+      if (result && result.ok === false) {
+        showToast("error", "Failed to blocklist", result.message);
+      } else {
+        showToast("success", "Blocklisted and searching for new release");
+      }
       qc.invalidateQueries({ queryKey: ["downloads"] });
       qc.invalidateQueries({ queryKey: ["download-stats"] });
     },
@@ -261,7 +273,7 @@ export function useCalendar({
     queryFn: () => apiFetch(`/calendar${qs ? `?${qs}` : ""}`),
     staleTime: 60_000,
     refetchInterval: 120_000,
-    keepPreviousData: true,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -584,7 +596,7 @@ export function useSetupStatus() {
     queryKey: ["setup-status"],
     queryFn: () => apiFetch("/setup/status"),
     staleTime: Infinity,
-    retry: false,
+    retry: 2,
   });
 }
 
@@ -646,9 +658,11 @@ export function useSetupComplete() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => apiFetch("/setup/complete", { method: "POST" }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["setup-status"] });
-      qc.invalidateQueries({ queryKey: ["auth-status"] });
+    onSuccess: async () => {
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["setup-status"] }),
+        qc.invalidateQueries({ queryKey: ["auth-status"] }),
+      ]);
     },
   });
 }
@@ -656,9 +670,12 @@ export function useSetupComplete() {
 export function useSetupReset() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () => apiFetch("/setup/reset", { method: "POST" }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["setup-status"] });
+    mutationFn: () => apiFetch("/setup/reset", {
+        method: "POST",
+        headers: { "X-Confirm-Reset": "true" },
+      }),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["setup-status"] });
     },
     onError: (err) => showToast("error", "Failed to reset setup", err.message),
   });
@@ -678,5 +695,28 @@ export function useUpdateAuthConfig() {
 export function useRegenerateApiKey() {
   return useMutation({
     mutationFn: () => apiFetch("/auth/apikey/regenerate", { method: "POST" }),
+  });
+}
+
+/** Fetch (creating if missing) the ICS calendar feed token. */
+export function useCalendarToken() {
+  return useQuery({
+    queryKey: ["calendar-token"],
+    queryFn: () => apiFetch("/auth/calendar-token"),
+    staleTime: Infinity,
+    refetchInterval: false,
+  });
+}
+
+/** Regenerate the ICS calendar feed token (invalidates old feed URLs). */
+export function useRegenerateCalendarToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiFetch("/auth/calendar-token/regenerate", { method: "POST" }),
+    onSuccess: (data) => {
+      qc.setQueryData(["calendar-token"], data);
+      showToast("success", "Calendar feed URL regenerated", "Update any calendar apps using the old URL.");
+    },
+    onError: (err) => showToast("error", "Failed to regenerate", err.message),
   });
 }
