@@ -619,8 +619,11 @@ export function useSetupDiscover() {
 }
 
 export function useSetupAuth() {
+  const qc = useQueryClient();
   return useMutation({
     mutationFn: (body) => apiFetch("/setup/auth", { method: "POST", body }),
+    // The backend sets the session cookie on success, so refresh auth state.
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["auth-status"] }),
   });
 }
 
