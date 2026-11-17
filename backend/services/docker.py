@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import re
+import shlex
 import struct
+import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 import httpx
 
@@ -40,6 +46,50 @@ def _docker_base_url() -> str:
 
 def _docker_url(path: str) -> str:
     return f"{_docker_base_url()}/{DOCKER_API_VERSION}{path}"
+
+
+def _is_tcp_socket(sock: str) -> bool:
+    """Return True when the configured Docker endpoint is TCP rather than a unix socket."""
+    return sock.startswith("tcp://") or sock.startswith("http://")
+
+
+def _docker_cli_host(sock: str) -> str:
+    """Return a DOCKER_HOST value (tcp://host:port) the docker CLI understands.
+
+    The CLI rejects ``http://`` endpoints, so TCP endpoints are normalised to
+    ``tcp://``. Unix socket paths are not usable as DOCKER_HOST inside a sidecar
+    (they are bind-mounted instead) and are returned as ``unix:///var/run/docker.sock``.
+    """
+    if sock.startswith("http://"):
+        return "tcp://" + sock[len("http://") :].rstrip("/")
+    if sock.startswith("tcp://"):
+        return sock.rstrip("/")
+    return "unix:///var/run/docker.sock"
+
+
+def _safe_http_url(url: str) -> str:
+    """Return ``url`` only if it is an absolute http(s) URL, else an empty string."""
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme in ("http", "https") and parsed.hostname:
+            parsed.port  # noqa: B018 - raises ValueError on a malformed port
+            return url.strip()
+    except ValueError:
+        pass
+    return ""
+
+
+async def get_docker_info() -> dict | None:
+    """Return the Docker daemon ``/info`` payload, or None if unreachable."""
+    try:
+        async with httpx.AsyncClient(transport=_docker_transport(), timeout=5) as client:
+            resp = await client.get(_docker_url("/info"))
+            if resp.status_code == 200:
+                data = resp.json()
+                return data if isinstance(data, dict) else None
+    except (httpx.HTTPError, ValueError):
+        pass
+    return None
 
 
 def _human_uptime(started_at: str) -> str:
@@ -165,7 +215,8 @@ def _extract_public_urls(labels: dict) -> list[dict]:
         urls.append({"url": custom_url, "source": "custom"})
         seen.add(custom_url)
 
-    return urls
+    # Only http(s) URLs may reach the UI (drops javascript:, data:, etc.)
+    return [u for u in urls if _safe_http_url(u["url"])]
 
 
 def _parse_container(container: dict, stats: dict | None = None) -> dict:
@@ -211,8 +262,9 @@ def _parse_container(container: dict, stats: dict | None = None) -> dict:
 
     # Resolve human-readable image name, multiple fallback sources
     image = container.get("Image", "")
-    labels = container.get("Labels", {}) or {}
     config_obj = container.get("Config", {}) if isinstance(container.get("Config"), dict) else {}
+    # The list endpoint exposes top-level "Labels"; inspect nests them in Config.Labels.
+    labels = container.get("Labels") or config_obj.get("Labels") or {}
 
     # Priority: Compose label > Config.Image > OCI label > top-level Image
     compose_image = labels.get("com.docker.compose.image", "")
@@ -242,7 +294,7 @@ def _parse_container(container: dict, stats: dict | None = None) -> dict:
         "memory_usage": mem_usage,
         "memory_limit": mem_limit,
         "restart_count": restart_count,
-        "urls": _extract_public_urls(container.get("Labels", {})),
+        "urls": _extract_public_urls(labels),
     }
 
 
@@ -256,7 +308,7 @@ async def _fetch_stats(client: httpx.AsyncClient, container_id: str) -> dict | N
         )
         if resp.status_code == 200:
             return resp.json()
-    except (httpx.TimeoutException, httpx.ConnectError):
+    except (httpx.HTTPError, ValueError):
         pass
     return None
 
@@ -306,11 +358,103 @@ ALLOWED_ACTIONS = frozenset({"start", "stop", "restart"})
 PULL_TIMEOUT = 300  # 5 minutes for image pulls
 
 
+def _pull_stream_error(body: str) -> str | None:
+    """Return the first error found in an ``/images/create`` JSON-lines stream.
+
+    The Engine answers ``200`` even when a pull fails midway; the failure is only
+    reported as ``{"error": ..., "errorDetail": {...}}`` in the streamed body.
+    """
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        detail = obj.get("errorDetail")
+        msg = obj.get("error") or (detail.get("message") if isinstance(detail, dict) else None)
+        if msg or detail:
+            return str(msg or "pull failed")[:200]
+    return None
+
+
+async def _pull_image(
+    client: httpx.AsyncClient, image: str, *, timeout: float = PULL_TIMEOUT
+) -> str | None:
+    """Pull ``image`` via the Engine API. Returns None on success, else an error string."""
+    resp = await client.post(
+        _docker_url("/images/create"), params={"fromImage": image}, timeout=timeout
+    )
+    if resp.status_code not in (200, 204):
+        return f"HTTP {resp.status_code}"
+    return _pull_stream_error(resp.text)
+
+
+async def _image_config(client: httpx.AsyncClient, image_ref: str) -> dict:
+    """Return the ``Config`` section of a local image, or {} if it cannot be inspected."""
+    try:
+        resp = await client.get(_docker_url(f"/images/{image_ref}/json"))
+        if resp.status_code == 200:
+            cfg = resp.json().get("Config")
+            if isinstance(cfg, dict):
+                return cfg
+    except (httpx.HTTPError, ValueError):
+        pass
+    return {}
+
+
+def _user_env(env: list[str] | None, image_env: list[str] | None) -> list[str]:
+    """Return container env entries that are not just the old image's defaults."""
+    defaults = set(image_env or [])
+    return [e for e in env or [] if e not in defaults]
+
+
+def _user_labels(labels: dict | None, image_labels: dict | None) -> dict[str, str]:
+    """Return container labels that are not just inherited from the old image."""
+    inherited = image_labels or {}
+    return {k: v for k, v in (labels or {}).items() if k not in inherited or inherited[k] != v}
+
+
+def _strip_image_defaults(config: dict, image_config: dict, container_id: str) -> dict:
+    """Copy a container ``Config`` without values merely inherited from its old image.
+
+    Pinning the old image's ENV/labels/CMD onto the recreated container would
+    override the new image's updated defaults (e.g. PYTHON_VERSION, PATH).
+    """
+    out = dict(config)
+    out["Env"] = _user_env(config.get("Env"), image_config.get("Env"))
+    out["Labels"] = _user_labels(config.get("Labels"), image_config.get("Labels"))
+    for key in (
+        "Cmd",
+        "Entrypoint",
+        "Healthcheck",
+        "User",
+        "WorkingDir",
+        "ExposedPorts",
+        "Volumes",
+    ):
+        if key in out and out[key] == image_config.get(key):
+            del out[key]
+    if out.get("Hostname") == container_id[:12]:
+        del out["Hostname"]
+    return out
+
+
+def _endpoint_config(net_config: dict, short_id: str) -> dict:
+    """Build an EndpointConfig for create/connect from an inspected network entry."""
+    aliases = [a for a in net_config.get("Aliases") or [] if a != short_id]
+    return {"IPAMConfig": net_config.get("IPAMConfig"), "Aliases": aliases or None}
+
+
 async def pull_and_recreate(name_or_id: str) -> dict:
     """Pull the latest image and fully recreate the container.
 
     Watchtower-style update: inspect → pull → stop → remove → create → start → reconnect networks.
-    Preserves all config: env vars, volumes, ports, labels, restart policy, networks.
+    Preserves container-specific config (env vars, volumes, ports, labels, restart policy,
+    networks) but not values merely inherited from the old image.
 
     NOTE: Do NOT call this from within the container being updated. The stop step
     will kill the running process before the new container can be started, leaving
@@ -336,14 +480,14 @@ async def pull_and_recreate(name_or_id: str) -> dict:
             if not image:
                 return {"status": "error", "message": "Cannot determine container image"}
 
-            # 2. Pull the latest image
+            # 2. Pull the latest image (a failed pull still answers HTTP 200)
             logger.info("Pulling image %s for container %s", image, container_name)
-            pull_resp = await client.post(
-                _docker_url("/images/create"),
-                params={"fromImage": image},
-            )
-            if pull_resp.status_code not in (200, 204):
-                return {"status": "error", "message": f"Pull failed: HTTP {pull_resp.status_code}"}
+            pull_error = await _pull_image(client, image)
+            if pull_error:
+                logger.warning("Pull failed for %s: %s", image, pull_error)
+                return {"status": "error", "message": f"Pull failed: {pull_error}"}
+
+            old_image_config = await _image_config(client, old.get("Image", ""))
 
             # 3. Stop the old container
             await client.post(
@@ -369,19 +513,19 @@ async def pull_and_recreate(name_or_id: str) -> dict:
                     container_name,
                 )
             create_body: dict = {
-                **config,
+                **_strip_image_defaults(config, old_image_config, old.get("Id", "")),
                 "HostConfig": host_config,
             }
 
             # Attach to the same networks
             networks = network_settings.get("Networks", {})
+            short_id = old.get("Id", "")[:12]
             if networks:
                 networking_config: dict = {"EndpointsConfig": {}}
                 for net_name, net_config in networks.items():
-                    networking_config["EndpointsConfig"][net_name] = {
-                        "IPAMConfig": net_config.get("IPAMConfig"),
-                        "Aliases": net_config.get("Aliases"),
-                    }
+                    networking_config["EndpointsConfig"][net_name] = _endpoint_config(
+                        net_config, short_id
+                    )
                 create_body["NetworkingConfig"] = networking_config
 
             # 6. Create the new container with the same name
@@ -401,15 +545,11 @@ async def pull_and_recreate(name_or_id: str) -> dict:
 
             # 7. Connect to additional networks (create only connects to the first)
             for net_name in list(networks.keys())[1:]:
-                net_config = networks[net_name]
                 await client.post(
                     _docker_url(f"/networks/{net_name}/connect"),
                     json={
                         "Container": new_id,
-                        "EndpointConfig": {
-                            "IPAMConfig": net_config.get("IPAMConfig"),
-                            "Aliases": net_config.get("Aliases"),
-                        },
+                        "EndpointConfig": _endpoint_config(networks[net_name], short_id),
                     },
                 )
 
@@ -434,46 +574,409 @@ async def pull_and_recreate(name_or_id: str) -> dict:
         return {"status": "error", "message": "Container update failed, check server logs"}
 
 
-async def self_update() -> dict:
+# ── Self-update helpers (pure, unit-tested) ──────────────────────────────────
+
+SELF_CONTAINER_NAME = "panelarr"
+SIDECAR_IMAGE = "docker:27-cli"
+_VERSION_TAG_RE = re.compile(r"^v?\d+(\.\d+){1,3}([.-][0-9A-Za-z.-]+)?$")
+_DEFAULT_SHM_SIZE = 64 * 1024 * 1024
+
+
+def _shell_quote(s: str) -> str:
+    """Minimal shell single-quote escaping for embedding in a sh -c script."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def is_version_tag(tag: str) -> bool:
+    """Return True if ``tag`` looks like a release version (``0.3.0``, ``v1.2.3-alpha``)."""
+    return bool(_VERSION_TAG_RE.match(tag or ""))
+
+
+def resolve_update_image(image: str, target_version: str | None) -> str:
+    """Return the image reference self-update should pull.
+
+    A version-pinned tag can never update by re-pulling itself, so when the
+    current tag looks like a version and ``target_version`` is a valid version,
+    the tag is swapped for the target. ``latest``/``dev``/digest-pinned
+    references are returned unchanged (re-pull the same tag).
+    """
+    registry, repo, tag = _parse_image_ref(image)
+    if (
+        not target_version
+        or not tag
+        or not is_version_tag(tag)
+        or not is_version_tag(target_version)
+    ):
+        return image
+    base = image.split("@", 1)[0]
+    last = base.rsplit("/", 1)[-1]
+    if ":" in last:
+        base = base.rsplit(":", 1)[0]
+    new_tag = target_version
+    if tag.startswith("v") and not new_tag.startswith("v"):
+        new_tag = f"v{new_tag}"
+    elif not tag.startswith("v") and new_tag.startswith("v"):
+        new_tag = new_tag[1:]
+    return f"{base}:{new_tag}"
+
+
+def _mount_csv(fields: list[tuple[str, str | None]]) -> str:
+    """Build a ``--mount`` CSV value, quoting fields that contain commas or quotes."""
+    out: list[str] = []
+    for key, value in fields:
+        item = key if value is None else f"{key}={value}"
+        if "," in item or '"' in item:
+            item = '"' + item.replace('"', '""') + '"'
+        out.append(item)
+    return ",".join(out)
+
+
+def _mount_args(host_config: dict) -> list[str]:
+    """Translate HostConfig.Binds and HostConfig.Mounts into docker CLI flags."""
+    argv: list[str] = []
+    for bind in host_config.get("Binds") or []:
+        argv += ["--volume", bind]
+    for mount in host_config.get("Mounts") or []:
+        mtype = mount.get("Type", "")
+        target = mount.get("Target") or mount.get("Destination") or ""
+        source = mount.get("Source") or mount.get("Name") or ""
+        if not target or mtype not in ("bind", "volume", "tmpfs"):
+            continue
+        fields: list[tuple[str, str | None]] = [("type", mtype)]
+        if mtype != "tmpfs":
+            if not source:
+                continue
+            fields.append(("source", source))
+        fields.append(("target", target))
+        if mount.get("ReadOnly"):
+            fields.append(("readonly", None))
+        bind_opts = mount.get("BindOptions") or {}
+        if mtype == "bind" and bind_opts.get("Propagation"):
+            fields.append(("bind-propagation", bind_opts["Propagation"]))
+        tmpfs_opts = mount.get("TmpfsOptions") or {}
+        if mtype == "tmpfs":
+            if tmpfs_opts.get("SizeBytes"):
+                fields.append(("tmpfs-size", str(tmpfs_opts["SizeBytes"])))
+            if tmpfs_opts.get("Mode"):
+                fields.append(("tmpfs-mode", str(tmpfs_opts["Mode"])))
+        argv += ["--mount", _mount_csv(fields)]
+    for path, opts in (host_config.get("Tmpfs") or {}).items():
+        argv += ["--tmpfs", f"{path}:{opts}" if opts else path]
+    return argv
+
+
+def _network_args(old: dict, container_name: str) -> tuple[list[str], list[list[str]]]:
+    """Build ``--network`` flags plus ``docker network connect`` commands for extras."""
+    host_config = old.get("HostConfig") or {}
+    mode = host_config.get("NetworkMode") or ""
+    nets = (old.get("NetworkSettings") or {}).get("Networks") or {}
+    short_id = (old.get("Id") or "")[:12]
+    if mode in ("host", "none") or mode.startswith("container:"):
+        return ["--network", mode], []
+    names = list(nets.keys())
+    if mode in names:
+        names.remove(mode)
+        names.insert(0, mode)
+
+    args: list[str] = []
+    connects: list[list[str]] = []
+    for idx, net in enumerate(names):
+        ep = nets[net] or {}
+        flags: list[str] = []
+        if net != "bridge":  # aliases / static IPs need a user-defined network
+            alias_flag = "--network-alias" if idx == 0 else "--alias"
+            for alias in ep.get("Aliases") or []:
+                if alias not in (short_id, container_name):
+                    flags += [alias_flag, alias]
+            ipam = ep.get("IPAMConfig") or {}
+            if ipam.get("IPv4Address"):
+                flags += ["--ip", ipam["IPv4Address"]]
+            if ipam.get("IPv6Address"):
+                flags += ["--ip6", ipam["IPv6Address"]]
+        if idx == 0:
+            args += ["--network", net, *flags]
+        else:
+            connects.append(["docker", "network", "connect", *flags, net, container_name])
+    return args, connects
+
+
+def _healthcheck_args(healthcheck: dict, image_healthcheck: dict | None) -> list[str]:
+    """Translate Config.Healthcheck into ``--health-*`` flags (CMD and CMD-SHELL forms)."""
+    if not healthcheck or healthcheck == (image_healthcheck or {}):
+        return []
+    test = healthcheck.get("Test") or []
+    if test and test[0] == "NONE":
+        return ["--no-healthcheck"]
+    argv: list[str] = []
+    if len(test) > 1:
+        if test[0] == "CMD-SHELL":
+            cmd = test[1]
+        elif test[0] == "CMD":
+            cmd = shlex.join(test[1:])
+        else:
+            cmd = ""
+        if cmd:
+            argv += ["--health-cmd", cmd]
+    for key, flag in (
+        ("Interval", "--health-interval"),
+        ("Timeout", "--health-timeout"),
+        ("StartPeriod", "--health-start-period"),
+    ):
+        if healthcheck.get(key):
+            argv += [flag, f"{healthcheck[key] // 1_000_000}ms"]
+    if healthcheck.get("Retries"):
+        argv += ["--health-retries", str(healthcheck["Retries"])]
+    return argv
+
+
+@dataclass
+class RecreatePlan:
+    """Everything the sidecar needs to recreate a container with the docker CLI."""
+
+    argv: list[str]
+    env_file: str
+    network_connects: list[list[str]] = field(default_factory=list)
+
+
+def build_recreate_plan(
+    old: dict, image: str, image_config: dict | None = None, *, env_file_path: str = ""
+) -> RecreatePlan:
+    """Build the ``docker create`` argv for recreating ``old`` (an inspect payload).
+
+    ``image_config`` is the OLD image's Config; env/labels/cmd that equal its
+    defaults are not pinned onto the new container. Container env vars are never
+    placed in argv, they are returned as ``env_file`` content (one ``KEY=VALUE``
+    per line) and referenced via ``--env-file env_file_path``.
+    """
+    image_config = image_config or {}
+    config = old.get("Config") or {}
+    host_config = old.get("HostConfig") or {}
+    container_name = (old.get("Name") or "").lstrip("/")
+    container_id = old.get("Id") or ""
+    argv: list[str] = ["docker", "create", "--name", container_name]
+
+    restart = host_config.get("RestartPolicy") or {}
+    rp_name = restart.get("Name", "")
+    if rp_name and rp_name != "no":
+        retries = restart.get("MaximumRetryCount", 0)
+        argv += [
+            "--restart",
+            f"on-failure:{retries}" if rp_name == "on-failure" and retries else rp_name,
+        ]
+
+    env_lines: list[str] = []
+    for entry in _user_env(config.get("Env"), image_config.get("Env")):
+        if "\n" in entry:
+            logger.warning("self_update: dropping multi-line env var that --env-file cannot carry")
+            continue
+        env_lines.append(entry)
+    if env_lines and env_file_path:
+        argv += ["--env-file", env_file_path]
+
+    for k, v in _user_labels(config.get("Labels"), image_config.get("Labels")).items():
+        argv += ["--label", f"{k}={v}"]
+
+    argv += _mount_args(host_config)
+
+    net_args, connects = _network_args(old, container_name)
+    argv += net_args
+    net_mode = host_config.get("NetworkMode") or ""
+    if net_mode != "host" and not net_mode.startswith("container:"):
+        for container_port, bindings in (host_config.get("PortBindings") or {}).items():
+            for hb in bindings or []:
+                host_ip, host_port = hb.get("HostIp", ""), hb.get("HostPort", "")
+                if host_ip:
+                    argv += ["--publish", f"{host_ip}:{host_port}:{container_port}"]
+                elif host_port:
+                    argv += ["--publish", f"{host_port}:{container_port}"]
+                else:
+                    argv += ["--publish", container_port]
+
+    hostname = config.get("Hostname", "")
+    if hostname and hostname != container_id[:12] and net_mode != "host":
+        argv += ["--hostname", hostname]
+    if config.get("Domainname"):
+        argv += ["--domainname", config["Domainname"]]
+    if config.get("User") and config.get("User") != image_config.get("User"):
+        argv += ["--user", config["User"]]
+    if config.get("WorkingDir") and config.get("WorkingDir") != image_config.get("WorkingDir"):
+        argv += ["--workdir", config["WorkingDir"]]
+    if config.get("Tty"):
+        argv.append("--tty")
+    if config.get("OpenStdin"):
+        argv.append("--interactive")
+
+    for flag, key in (
+        ("--dns", "Dns"),
+        ("--dns-search", "DnsSearch"),
+        ("--dns-option", "DnsOptions"),
+        ("--add-host", "ExtraHosts"),
+        ("--security-opt", "SecurityOpt"),
+        ("--cap-add", "CapAdd"),
+        ("--cap-drop", "CapDrop"),
+        ("--group-add", "GroupAdd"),
+    ):
+        for value in host_config.get(key) or []:
+            argv += [flag, value]
+    for dev in host_config.get("Devices") or []:
+        host_path = dev.get("PathOnHost", "")
+        if host_path:
+            spec = f"{host_path}:{dev.get('PathInContainer') or host_path}"
+            perms = dev.get("CgroupPermissions")
+            argv += ["--device", f"{spec}:{perms}" if perms else spec]
+    for req in host_config.get("DeviceRequests") or []:
+        caps = [c for cs in req.get("Capabilities") or [] for c in cs]
+        if "gpu" in caps or req.get("Driver") == "nvidia":
+            ids = req.get("DeviceIDs") or []
+            if ids:
+                argv += ["--gpus", f'"device={",".join(ids)}"']
+            else:
+                argv += ["--gpus", "all" if req.get("Count", -1) == -1 else str(req["Count"])]
+    for key, value in (host_config.get("Sysctls") or {}).items():
+        argv += ["--sysctl", f"{key}={value}"]
+    for ul in host_config.get("Ulimits") or []:
+        argv += ["--ulimit", f"{ul.get('Name')}={ul.get('Soft')}:{ul.get('Hard')}"]
+    if host_config.get("Privileged"):
+        argv.append("--privileged")
+    if host_config.get("ReadonlyRootfs"):
+        argv.append("--read-only")
+    if host_config.get("Init"):
+        argv.append("--init")
+    for flag, key, skip in (
+        ("--pid", "PidMode", ("", "private")),
+        ("--ipc", "IpcMode", ("", "private", "shareable", "none")),
+        ("--userns", "UsernsMode", ("",)),
+    ):
+        value = host_config.get(key) or ""
+        if value not in skip:
+            argv += [flag, value]
+    shm = host_config.get("ShmSize") or 0
+    if shm and shm != _DEFAULT_SHM_SIZE:
+        argv += ["--shm-size", str(shm)]
+    log_cfg = host_config.get("LogConfig") or {}
+    if log_cfg.get("Type") and log_cfg["Type"] not in ("json-file", "json"):
+        argv += ["--log-driver", log_cfg["Type"]]
+    for k, v in (log_cfg.get("Config") or {}).items():
+        argv += ["--log-opt", f"{k}={v}"]
+
+    if host_config.get("Memory"):
+        argv += ["--memory", str(host_config["Memory"])]
+    if host_config.get("NanoCpus"):
+        argv += ["--cpus", str(host_config["NanoCpus"] / 1_000_000_000)]
+
+    argv += _healthcheck_args(config.get("Healthcheck") or {}, image_config.get("Healthcheck"))
+
+    # Entrypoint / Cmd overrides (only if they differ from the old image's defaults)
+    cmd_tail: list[str] = (
+        list(config.get("Cmd") or []) if config.get("Cmd") != image_config.get("Cmd") else []
+    )
+    entrypoint = config.get("Entrypoint") or []
+    if entrypoint != (image_config.get("Entrypoint") or []):
+        if entrypoint:
+            argv += ["--entrypoint", entrypoint[0]]
+            cmd_tail = list(entrypoint[1:]) + (list(config.get("Cmd") or []))
+        else:
+            argv += ["--entrypoint", ""]
+    argv.append(image)
+    argv += cmd_tail
+
+    return RecreatePlan(argv=argv, env_file="\n".join(env_lines), network_connects=connects)
+
+
+def build_update_script(
+    container_name: str, plan: RecreatePlan, env_file_path: str = "/tmp/panelarr.env"
+) -> str:
+    """Build the sidecar shell script performing a rollback-safe swap.
+
+    Sequence: stop old → rename old to ``<name>-old`` → create + connect + start new →
+    verify it is running → remove old. If create/start fails the new container is
+    removed, the old one is renamed back and started again.
+    """
+    name = _shell_quote(container_name)
+    old_name = _shell_quote(f"{container_name}-old")
+    create_cmd = " ".join(_shell_quote(a) for a in plan.argv)
+    connect_cmds = " && ".join(" ".join(_shell_quote(a) for a in c) for c in plan.network_connects)
+    steps = [create_cmd]
+    if connect_cmds:
+        steps.append(connect_cmds)
+    steps.append(f"docker start {name}")
+    steps.append(f'sleep 5 && [ "$(docker inspect -f "{{{{.State.Running}}}}" {name})" = "true" ]')
+    chain = " && ".join(steps)
+    env_write = (
+        f'printf %s "$PANELARR_ENV_B64" | base64 -d > {_shell_quote(env_file_path)}\n'
+        if plan.env_file
+        else ""
+    )
+    return (
+        "set -u\n"
+        "sleep 2\n"
+        f"docker rm -f {old_name} >/dev/null 2>&1 || true\n"
+        f"docker stop --time 10 {name} || exit 1\n"
+        f"docker rename {name} {old_name} || {{ docker start {name}; exit 1; }}\n"
+        f"{env_write}"
+        "rollback() {\n"
+        f"  docker rm -f {name} >/dev/null 2>&1\n"
+        f"  docker rename {old_name} {name} && docker start {name}\n"
+        f"  rm -f {_shell_quote(env_file_path)}\n"
+        "  exit 1\n"
+        "}\n"
+        f"( {chain} ) || rollback\n"
+        f"rm -f {_shell_quote(env_file_path)}\n"
+        f"docker rm -f {old_name}\n"
+    )
+
+
+def build_sidecar_spec(
+    script: str,
+    env_file: str,
+    docker_socket: str,
+    self_networks: list[str],
+    self_network_mode: str = "",
+) -> dict:
+    """Build the Engine API create body for the ephemeral ``docker:cli`` sidecar.
+
+    TCP endpoints (socket proxies) usually resolve only on a compose network, so
+    the sidecar joins the same network(s) as panelarr instead of host networking.
+    The container env (which holds secrets) travels via the sidecar's Env as a
+    base64 env-file, never in Cmd.
+    """
+    env = []
+    if env_file:
+        env.append("PANELARR_ENV_B64=" + base64.b64encode(env_file.encode()).decode())
+    body: dict = {
+        "Image": SIDECAR_IMAGE,
+        "Cmd": ["/bin/sh", "-c", script],
+        "Env": env,
+    }
+    if _is_tcp_socket(docker_socket):
+        env.append(f"DOCKER_HOST={_docker_cli_host(docker_socket)}")
+        nets = [n for n in self_networks if n not in ("host", "none")]
+        if nets and self_network_mode != "host":
+            body["HostConfig"] = {"AutoRemove": True, "NetworkMode": nets[0]}
+            body["NetworkingConfig"] = {"EndpointsConfig": {n: {} for n in nets}}
+        else:
+            body["HostConfig"] = {"AutoRemove": True, "NetworkMode": "host"}
+    else:
+        body["HostConfig"] = {
+            "AutoRemove": True,
+            "Binds": [f"{docker_socket}:/var/run/docker.sock"],
+            "NetworkMode": "none",
+        }
+    return body
+
+
+async def self_update(target_version: str | None = None) -> dict:
     """Safely update the panelarr container from within itself.
 
-    The fundamental problem with self-updating is that the process doing the
-    update lives inside the container being replaced. A naive
-    stop → remove → create → start sequence kills the executing process at the
-    stop step, so the create and start steps never run, leaving the service
-    permanently down.
+    The process doing the update lives inside the container being replaced, so
+    the destructive steps are delegated to an ephemeral ``docker:cli`` sidecar
+    that outlives panelarr. Panelarr inspects itself, pulls the new image via
+    the Engine API (aborting before touching anything if the pull fails) and
+    starts the sidecar, which runs a rollback-safe swap script (see
+    ``build_update_script``).
 
-    Why other approaches fail
-    -------------------------
-    * **Blue/green port swap** – the new container cannot bind port 8000 while
-      the old one is still running.
-    * **docker update** – the Docker Engine API's POST /containers/{id}/update
-      only changes resource limits; you cannot change the image in place.
-    * **Kill PID 1 + restart policy** – Docker's restart policy reuses the image
-      layer the container was *created* from, not any newly pulled image, so the
-      same old version comes back.
-    * **Rename + create** – still has the port conflict problem during the
-      window where both containers exist.
-
-    The correct approach: ephemeral sidecar container
-    -------------------------------------------------
-    Pull the new image first (so it is cached locally, same as what the new
-    container will use). Then spawn a one-shot ephemeral ``docker:cli`` container
-    via the Docker socket. That sidecar runs entirely outside of the panelarr
-    process tree; it outlives panelarr, performs the stop/rm/create/start
-    sequence, and then exits. The sidecar has no port bindings, no name
-    conflicts, and its only dependency is the Docker socket.
-
-    The sequence inside the sidecar shell script:
-        docker stop panelarr
-        docker rm panelarr
-        docker create --name panelarr <all original flags reconstructed>
-        docker network connect <extra networks>
-        docker start panelarr
-        docker rm sidecar (self-cleanup via --rm flag)
-
-    This is the same mechanism Watchtower uses when updating itself: it
-    schedules a lifecycle hook that runs as an external process.
+    ``target_version`` lets a version-pinned tag (``:0.3.0``) move to a newer
+    release; it is ignored for ``latest``/``dev`` tags, which are simply re-pulled.
 
     After returning ``{"status": "updating"}`` the frontend should poll
     ``GET /api/system/health`` until it gets a 200 response with the new
@@ -481,217 +984,51 @@ async def self_update() -> dict:
     """
     try:
         async with httpx.AsyncClient(transport=_docker_transport(), timeout=PULL_TIMEOUT) as client:
-            # ── 1. Inspect ourselves ─────────────────────────────────────────────
-            # We identify our own container by the name "panelarr" (set in
-            # docker-compose.yml via container_name). Using the name is robust
-            # because the container ID changes on every recreation.
-            inspect_resp = await client.get(_docker_url("/containers/panelarr/json"))
+            inspect_resp = await client.get(_docker_url(f"/containers/{SELF_CONTAINER_NAME}/json"))
             if inspect_resp.status_code == 404:
                 return {
                     "status": "error",
-                    "message": "Container 'panelarr' not found — is container_name set?",
+                    "message": "Container 'panelarr' not found, is container_name set?",
                 }
             inspect_resp.raise_for_status()
             old = inspect_resp.json()
 
-            config = old.get("Config", {})
-            host_config = old.get("HostConfig", {})
-            network_settings = old.get("NetworkSettings", {})
-            container_name = old.get("Name", "").lstrip("/")
-            image = config.get("Image", "")
-
-            if not image:
+            current_image = (old.get("Config") or {}).get("Image", "")
+            if not current_image:
                 return {"status": "error", "message": "Cannot determine container image"}
+            image = resolve_update_image(current_image, target_version)
 
-            # ── 2. Pull the new image ────────────────────────────────────────────
-            # Pull via the Engine API (not docker CLI) so we get the image layer
-            # cached locally before we touch the running container. If the pull
-            # fails we abort early — the running container is untouched.
             logger.info("self_update: pulling %s", image)
-            pull_resp = await client.post(
-                _docker_url("/images/create"),
-                params={"fromImage": image},
-                timeout=PULL_TIMEOUT,
-            )
-            if pull_resp.status_code not in (200, 204):
+            pull_error = await _pull_image(client, image)
+            if pull_error:
+                logger.warning("self_update: pull failed for %s: %s", image, pull_error)
                 return {
                     "status": "error",
-                    "message": f"Image pull failed: HTTP {pull_resp.status_code}",
+                    "message": f"Image pull failed: {pull_error}",
                 }
             logger.info("self_update: pull complete for %s", image)
 
-            # ── 3. Build the docker-run argv for the recreated panelarr container ─
-            # We reconstruct the full set of flags from the inspect output so the
-            # new container is identical to the old one. The sidecar will pass
-            # these to ``docker run`` / ``docker create`` + ``docker start``.
-            argv: list[str] = ["docker", "create", "--name", container_name]
+            old_image_config = await _image_config(client, old.get("Image", ""))
+            env_path = "/tmp/panelarr.env"
+            plan = build_recreate_plan(old, image, old_image_config, env_file_path=env_path)
+            container_name = (old.get("Name") or "").lstrip("/") or SELF_CONTAINER_NAME
+            script = build_update_script(container_name, plan, env_path)
 
-            # Restart policy
-            restart_policy = host_config.get("RestartPolicy", {})
-            rp_name = restart_policy.get("Name", "")
-            if rp_name and rp_name != "no":
-                max_retry = restart_policy.get("MaximumRetryCount", 0)
-                if rp_name == "on-failure" and max_retry:
-                    argv += ["--restart", f"on-failure:{max_retry}"]
-                else:
-                    argv += ["--restart", rp_name]
-
-            # Environment variables
-            for env_var in config.get("Env") or []:
-                argv += ["--env", env_var]
-
-            # Volume binds
-            for bind in host_config.get("Binds") or []:
-                argv += ["--volume", bind]
-
-            # Named volumes (Mounts with type=volume)
-            for mount in host_config.get("Mounts") or []:
-                if mount.get("Type") == "volume":
-                    src = mount.get("Source") or mount.get("Name", "")
-                    dst = mount.get("Destination", "")
-                    mode = "ro" if mount.get("ReadOnly") else "rw"
-                    if src and dst:
-                        argv += ["--volume", f"{src}:{dst}:{mode}"]
-
-            # Port bindings
-            port_bindings = host_config.get("PortBindings") or {}
-            for container_port, host_bindings in port_bindings.items():
-                for hb in host_bindings or []:
-                    host_ip = hb.get("HostIp", "")
-                    host_port = hb.get("HostPort", "")
-                    if host_ip:
-                        argv += ["--publish", f"{host_ip}:{host_port}:{container_port}"]
-                    else:
-                        argv += ["--publish", f"{host_port}:{container_port}"]
-
-            # Labels
-            for k, v in (config.get("Labels") or {}).items():
-                argv += ["--label", f"{k}={v}"]
-
-            # Capabilities
-            for cap in host_config.get("CapAdd") or []:
-                argv += ["--cap-add", cap]
-            for cap in host_config.get("CapDrop") or []:
-                argv += ["--cap-drop", cap]
-
-            # Memory / CPU limits (docker create flags)
-            mem_limit = host_config.get("Memory", 0)
-            if mem_limit:
-                argv += ["--memory", str(mem_limit)]
-            nano_cpus = host_config.get("NanoCpus", 0)
-            if nano_cpus:
-                # NanoCPUs → fractional CPUs string (e.g. 1000000000 → "1.0")
-                argv += ["--cpus", str(nano_cpus / 1_000_000_000)]
-
-            # tmpfs mounts
-            for tmpfs_path in (host_config.get("Tmpfs") or {}).keys():
-                argv += ["--tmpfs", tmpfs_path]
-
-            # Privileged (preserve if set, though Panelarr drops this)
-            if host_config.get("Privileged"):
-                argv.append("--privileged")
-
-            # Healthcheck (pass through if defined in the container)
-            healthcheck = config.get("Healthcheck") or {}
-            hc_test = healthcheck.get("Test") or []
-            if hc_test and hc_test[0] not in ("NONE", ""):
-                # hc_test is ["CMD", ...] or ["CMD-SHELL", "..."]
-                hc_cmd = " ".join(hc_test[1:]) if hc_test[0] == "CMD-SHELL" else None
-                if hc_cmd:
-                    argv += ["--health-cmd", hc_cmd]
-                interval_ns = healthcheck.get("Interval", 0)
-                timeout_ns = healthcheck.get("Timeout", 0)
-                retries = healthcheck.get("Retries", 0)
-                start_ns = healthcheck.get("StartPeriod", 0)
-                if interval_ns:
-                    argv += ["--health-interval", f"{interval_ns // 1_000_000}ms"]
-                if timeout_ns:
-                    argv += ["--health-timeout", f"{timeout_ns // 1_000_000}ms"]
-                if retries:
-                    argv += ["--health-retries", str(retries)]
-                if start_ns:
-                    argv += ["--health-start-period", f"{start_ns // 1_000_000}ms"]
-
-            # Image must be last before any CMD override
-            argv.append(image)
-
-            # ── 4. Build extra network-connect commands ───────────────────────────
-            # ``docker create`` only attaches to the first network specified via
-            # --network. We emit additional ``docker network connect`` calls for
-            # any extra networks so the sidecar can run them after the create.
-            networks = network_settings.get("Networks", {})
-            net_names = list(networks.keys())
-
-            # Attach the first network during create (avoids a separate connect call)
-            if net_names:
-                argv = argv[:-1] + ["--network", net_names[0], argv[-1]]
-
-            extra_network_cmds: list[list[str]] = []
-            for net_name in net_names[1:]:
-                extra_network_cmds.append(
-                    ["docker", "network", "connect", net_name, container_name]
-                )
-
-            # ── 5. Build the sidecar shell script ───────────────────────────────
-            # The script:
-            #   a) waits a moment so the HTTP response can be flushed to the client
-            #   b) stops and removes the old panelarr container
-            #   c) creates the new one with the reconstructed argv
-            #   d) connects extra networks
-            #   e) starts it
-            #
-            # The sidecar container itself is started with --rm so Docker removes
-            # it automatically when the script exits.
-            create_cmd = " ".join(_shell_quote(a) for a in argv)
-            extra_net_lines = "\n".join(
-                " ".join(_shell_quote(a) for a in cmd) for cmd in extra_network_cmds
-            )
-            script = (
-                "set -e\n"
-                "sleep 2\n"
-                f"docker stop --time 10 {_shell_quote(container_name)}\n"
-                f"docker rm {_shell_quote(container_name)}\n"
-                f"{create_cmd}\n"
-                f"{extra_net_lines}\n"
-                f"docker start {_shell_quote(container_name)}\n"
+            self_networks = list(((old.get("NetworkSettings") or {}).get("Networks") or {}).keys())
+            sidecar_body = build_sidecar_spec(
+                script,
+                plan.env_file,
+                settings.docker_socket,
+                self_networks,
+                (old.get("HostConfig") or {}).get("NetworkMode", ""),
             )
 
-            # 6. Ensure the sidecar image is available locally
-            logger.info("self_update: pulling docker:cli sidecar image")
-            cli_pull = await client.post(
-                _docker_url("/images/create"),
-                params={"fromImage": "docker", "tag": "cli"},
-                timeout=60,
-            )
-            if cli_pull.status_code not in (200, 201):
-                logger.warning("self_update: docker:cli pull returned %s", cli_pull.status_code)
+            logger.info("self_update: pulling %s sidecar image", SIDECAR_IMAGE)
+            cli_error = await _pull_image(client, SIDECAR_IMAGE, timeout=60)
+            if cli_error:
+                logger.warning("self_update: sidecar image pull problem: %s", cli_error)
 
-            # 7. Launch the ephemeral sidecar
-            sidecar_name = f"panelarr-updater-{int(asyncio.get_event_loop().time())}"
-            sock = settings.docker_socket
-            if sock.startswith("tcp://") or sock.startswith("http://"):
-                # TCP socket proxy: sidecar connects via DOCKER_HOST env var
-                sidecar_host_config: dict = {
-                    "AutoRemove": True,
-                    "NetworkMode": "host",
-                }
-                sidecar_env = [f"DOCKER_HOST={sock}"]
-            else:
-                # Unix socket: mount it into the sidecar
-                sidecar_host_config = {
-                    "AutoRemove": True,
-                    "Binds": [f"{sock}:/var/run/docker.sock"],
-                    "NetworkMode": "none",
-                }
-                sidecar_env = []
-
-            sidecar_body: dict = {
-                "Image": "docker:cli",
-                "Cmd": ["/bin/sh", "-c", script],
-                "Env": sidecar_env,
-                "HostConfig": sidecar_host_config,
-            }
-
+            sidecar_name = f"panelarr-updater-{int(time.time())}"
             logger.info("self_update: launching sidecar %s", sidecar_name)
             create_resp = await client.post(
                 _docker_url("/containers/create"),
@@ -707,7 +1044,7 @@ async def self_update() -> dict:
                 )
                 return {
                     "status": "error",
-                    "message": "Failed to create updater sidecar — update aborted",
+                    "message": "Failed to create updater sidecar, update aborted",
                 }
 
             sidecar_id = create_resp.json().get("Id", "")
@@ -716,7 +1053,6 @@ async def self_update() -> dict:
                 timeout=10,
             )
             if start_resp.status_code not in (200, 204):
-                # Clean up the stranded sidecar
                 await client.delete(
                     _docker_url(f"/containers/{sidecar_id}"),
                     params={"force": "true"},
@@ -724,16 +1060,10 @@ async def self_update() -> dict:
                 )
                 return {
                     "status": "error",
-                    "message": "Failed to start updater sidecar — update aborted",
+                    "message": "Failed to start updater sidecar, update aborted",
                 }
 
-            logger.info(
-                "self_update: sidecar %s started; panelarr will be replaced in ~2 s",
-                sidecar_name,
-            )
-            # Return immediately. The sidecar will stop and recreate this container
-            # in ~2 seconds. The frontend polls /api/system/health until it gets
-            # a 200 with the new version, then reloads.
+            logger.info("self_update: sidecar %s started", sidecar_name)
             return {
                 "status": "updating",
                 "message": (
@@ -744,15 +1074,10 @@ async def self_update() -> dict:
             }
 
     except httpx.TimeoutException:
-        return {"status": "error", "message": "Image pull timed out — update aborted"}
+        return {"status": "error", "message": "Image pull timed out, update aborted"}
     except Exception:
         logger.exception("self_update failed")
-        return {"status": "error", "message": "Self-update failed — check server logs"}
-
-
-def _shell_quote(s: str) -> str:
-    """Minimal shell single-quote escaping for embedding in a sh -c script."""
-    return "'" + s.replace("'", "'\\''") + "'"
+        return {"status": "error", "message": "Self-update failed, check server logs"}
 
 
 async def container_action(name_or_id: str, action: str) -> dict:
@@ -879,35 +1204,129 @@ async def get_docker_version() -> dict | None:
         ) as client:
             resp = await client.get(_docker_url("/version"))
             resp.raise_for_status()
-            return resp.json()
-    except (httpx.ConnectError, httpx.TimeoutException):
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+    except (httpx.HTTPError, ValueError):
         return None
+
+
+DOCKER_HUB_REGISTRY = "registry-1.docker.io"
+REGISTRY_TIMEOUT = 5
+
+# (realm, service, scope) -> (token, monotonic expiry)
+_registry_token_cache: dict[tuple[str, str, str], tuple[str, float]] = {}
+
+
+@dataclass(frozen=True)
+class ImageRef:
+    """A parsed container image reference."""
+
+    registry: str
+    repo: str
+    tag: str  # "" when the reference is digest-pinned without a tag
+    digest: str = ""  # "sha256:..." when pinned by digest
+
+    @property
+    def pinned(self) -> bool:
+        """True when the reference is pinned to an immutable digest."""
+        return bool(self.digest)
+
+
+def _split_image_ref(image: str) -> ImageRef:
+    """Parse an image string into registry, repository, tag and digest.
+
+    Handles registry hosts with ports (``localhost:5000/img:tag``), implicit
+    Docker Hub library images and ``name@sha256:...`` / ``name:tag@sha256:...``.
+    """
+    ref, _, digest = image.partition("@")
+    tag = ""
+    last = ref.rsplit("/", 1)[-1]
+    if ":" in last:
+        ref, tag = ref.rsplit(":", 1)
+    if not tag and not digest:
+        tag = "latest"
+
+    parts = ref.split("/")
+    first = parts[0]
+    if len(parts) > 1 and ("." in first or ":" in first or first == "localhost"):
+        registry, repo = first, "/".join(parts[1:])
+        if registry in ("docker.io", "index.docker.io"):
+            registry = DOCKER_HUB_REGISTRY
+            if "/" not in repo:
+                repo = f"library/{repo}"
+    elif len(parts) == 1:
+        registry, repo = DOCKER_HUB_REGISTRY, f"library/{ref}"
+    else:
+        registry, repo = DOCKER_HUB_REGISTRY, ref
+    return ImageRef(registry=registry, repo=repo, tag=tag, digest=digest)
 
 
 def _parse_image_ref(image: str) -> tuple[str, str, str]:
     """Parse image string into (registry, repository, tag).
 
+    The tag is ``""`` for digest-pinned references without a tag.
+
     Examples:
         lscr.io/linuxserver/sonarr:latest -> (lscr.io, linuxserver/sonarr, latest)
         ghcr.io/org/app:v1 -> (ghcr.io, org/app, v1)
         nginx:latest -> (registry-1.docker.io, library/nginx, latest)
-        myapp -> (registry-1.docker.io, library/myapp, latest)
+        localhost:5000/img:tag -> (localhost:5000, img, tag)
+        nginx@sha256:abcd -> (registry-1.docker.io, library/nginx, "")
     """
-    tag = "latest"
-    if ":" in image and not image.rsplit(":", 1)[1].count("/"):
-        image, tag = image.rsplit(":", 1)
-    # Remove sha256 digest if present
-    if "@" in image:
-        image = image.split("@")[0]
+    ref = _split_image_ref(image)
+    return (ref.registry, ref.repo, ref.tag)
 
-    parts = image.split("/")
-    if len(parts) == 1:
-        return ("registry-1.docker.io", f"library/{parts[0]}", tag)
-    if len(parts) == 2 and "." not in parts[0] and ":" not in parts[0]:
-        return ("registry-1.docker.io", image, tag)
-    registry = parts[0]
-    repo = "/".join(parts[1:])
-    return (registry, repo, tag)
+
+def _parse_www_authenticate(header: str) -> dict[str, str] | None:
+    """Parse a ``WWW-Authenticate: Bearer realm="...",service="...",scope="..."`` header."""
+    if not header or not header.lower().startswith("bearer"):
+        return None
+    params = {k.lower(): v for k, v in re.findall(r'(\w+)="([^"]*)"', header)}
+    return params if params.get("realm") else None
+
+
+async def _get_registry_token(client: httpx.AsyncClient, challenge: dict[str, str]) -> str:
+    """Fetch (or reuse a cached) anonymous bearer token for a registry challenge."""
+    realm = challenge.get("realm", "")
+    if urlparse(realm).scheme not in ("http", "https"):
+        return ""
+    key = (realm, challenge.get("service", ""), challenge.get("scope", ""))
+    cached = _registry_token_cache.get(key)
+    if cached and cached[1] > time.monotonic():
+        return cached[0]
+    params = {k: v for k, v in (("service", key[1]), ("scope", key[2])) if v}
+    resp = await client.get(realm, params=params, timeout=REGISTRY_TIMEOUT)
+    if resp.status_code != 200:
+        return ""
+    data = resp.json()
+    token = data.get("token") or data.get("access_token") or ""
+    if token:
+        ttl = max(int(data.get("expires_in") or 60) - 10, 5)
+        _registry_token_cache[key] = (token, time.monotonic() + ttl)
+    return token
+
+
+async def _registry_manifest_head(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """HEAD a manifest, performing the anonymous bearer-token flow on a 401."""
+    headers = {"Accept": _MANIFEST_ACCEPT}
+    resp = await client.head(url, headers=headers, timeout=REGISTRY_TIMEOUT)
+    if resp.status_code == 401:
+        challenge = _parse_www_authenticate(resp.headers.get("www-authenticate", ""))
+        if challenge:
+            token = await _get_registry_token(client, challenge)
+            if token:
+                resp = await client.head(
+                    url,
+                    headers={**headers, "Authorization": f"Bearer {token}"},
+                    timeout=REGISTRY_TIMEOUT,
+                )
+    return resp
+
+
+def _registry_scheme(registry: str) -> str:
+    """Local registries are conventionally plain http; everything else is https."""
+    host = registry.split(":")[0]
+    return "http" if host in ("localhost", "127.0.0.1") else "https"
 
 
 async def _check_single_container_update(
@@ -918,13 +1337,25 @@ async def _check_single_container_update(
     """Check a single container for an available image update.
 
     Returns (name, result_dict) or None if the container should be skipped.
+    Digest-pinned images are reported with ``pinned: True`` and never as updatable.
     """
     name = container.get("name", "")
     image = container.get("image", "")
     if not image:
         return None
 
-    reg, repo, tag = _parse_image_ref(image)
+    ref = _split_image_ref(image)
+    if ref.pinned:
+        return (
+            name,
+            {
+                "has_update": False,
+                "pinned": True,
+                "local_digest": ref.digest[:19],
+                "remote_digest": "",
+                "image": image,
+            },
+        )
     try:
         # Get local image digest from Docker
         img_resp = await docker.get(_docker_url(f"/images/{image}/json"))
@@ -938,33 +1369,11 @@ async def _check_single_container_update(
                 local_digest = d.split("@")[1]
                 break
 
-        # Query remote registry for latest digest via v2 manifest HEAD request
-        if reg == "registry-1.docker.io":
-            # Docker Hub requires a token
-            token_resp = await registry_client.get(
-                f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull",
-            )
-            if token_resp.status_code != 200:
-                return None
-            token = token_resp.json().get("token", "")
-            manifest_resp = await registry_client.head(
-                f"https://registry-1.docker.io/v2/{repo}/manifests/{tag}",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": _MANIFEST_ACCEPT,
-                },
-            )
-        elif reg == "ghcr.io":
-            manifest_resp = await registry_client.head(
-                f"https://ghcr.io/v2/{repo}/manifests/{tag}",
-                headers={"Accept": _MANIFEST_ACCEPT},
-            )
-        else:
-            # Generic v2 registry (lscr.io, etc.)
-            manifest_resp = await registry_client.head(
-                f"https://{reg}/v2/{repo}/manifests/{tag}",
-                headers={"Accept": _MANIFEST_ACCEPT},
-            )
+        # Query the remote registry's manifest digest (HEAD, with anonymous bearer auth)
+        manifest_resp = await _registry_manifest_head(
+            registry_client,
+            f"{_registry_scheme(ref.registry)}://{ref.registry}/v2/{ref.repo}/manifests/{ref.tag}",
+        )
 
         remote_digest = manifest_resp.headers.get("docker-content-digest", "")
         has_update = bool(local_digest and remote_digest and local_digest != remote_digest)
@@ -973,6 +1382,7 @@ async def _check_single_container_update(
             name,
             {
                 "has_update": has_update,
+                "pinned": False,
                 "local_digest": local_digest[:19] if local_digest else "",
                 "remote_digest": remote_digest[:19] if remote_digest else "",
                 "image": image,
@@ -991,7 +1401,7 @@ async def check_container_updates(containers: list[dict]) -> dict[str, dict]:
     """
     results: dict[str, dict] = {}
     async with httpx.AsyncClient(transport=_docker_transport(), timeout=DOCKER_TIMEOUT) as docker:
-        async with httpx.AsyncClient(timeout=10) as registry_client:
+        async with httpx.AsyncClient(timeout=REGISTRY_TIMEOUT) as registry_client:
             outcomes = await asyncio.gather(
                 *[_check_single_container_update(c, docker, registry_client) for c in containers],
                 return_exceptions=True,
