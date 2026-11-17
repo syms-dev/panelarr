@@ -3,7 +3,9 @@ import { Navigate, Outlet, createBrowserRouter, useLocation } from "react-router
 
 import Layout from "@/components/layout";
 import ErrorBoundary, { RootErrorBoundary } from "@/components/error-boundary";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { safeNextPath } from "@/lib/api";
 import { useAuth } from "@/hooks/use-auth";
 import { useSetupStatus } from "@/hooks/use-setup-status";
 
@@ -36,12 +38,26 @@ const PAGE_SPINNER = (
 );
 
 function RequireSetup() {
-  const { data, isLoading } = useSetupStatus();
+  const { data, isLoading, isError, error, refetch, isFetching } = useSetupStatus();
   const { pathname } = useLocation();
   const isUnderSetup = pathname.startsWith("/setup");
 
   if (isLoading) {
     return PAGE_SPINNER;
+  }
+
+  // A failed status check is NOT "setup incomplete": show a retry state
+  // instead of bouncing the user into the wizard.
+  if (isError || !data) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center gap-4 p-4 text-center">
+        <p className="font-medium">Could not load Panelarr status</p>
+        <p className="text-sm text-muted-foreground">{error?.message || "The server did not respond."}</p>
+        <Button onClick={() => refetch()} loading={isFetching}>
+          Retry
+        </Button>
+      </div>
+    );
   }
 
   // If setup not complete and user is not already on /setup, redirect there
@@ -59,6 +75,7 @@ function RequireSetup() {
 
 function RequireAuth() {
   const { mode, isAuthenticated, isLoading } = useAuth();
+  const location = useLocation();
 
   if (isLoading) {
     return PAGE_SPINNER;
@@ -71,7 +88,11 @@ function RequireAuth() {
 
   // Auth required but not authenticated
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    const here = `${location.pathname}${location.search}${location.hash}`;
+    const next = safeNextPath(here);
+    return (
+      <Navigate to={next && next !== "/" ? `/login?next=${encodeURIComponent(next)}` : "/login"} replace />
+    );
   }
 
   return <Outlet />;
