@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { BanIcon, PauseIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
+import { BanIcon, PauseIcon, PlayIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
 
 import {
   AlertDialog,
@@ -117,7 +117,7 @@ function DownloadTable({ items }) {
               {formatSize(dl.size)}
             </TableCell>
             <TableCell className="hidden lg:table-cell text-muted-foreground text-sm tabular-nums">
-              {dl.time_left || ", "}
+              {dl.time_left || "—"}
             </TableCell>
             <TableCell className="text-right">
               <div className="flex items-center justify-end gap-1">
@@ -185,14 +185,27 @@ function DownloadTable({ items }) {
   );
 }
 
-function QbitTorrentTable({ filter }) {
-  const { data } = useQbitTorrents(filter);
+/** qBittorrent 4 reports "paused*", qBittorrent 5 reports "stopped*". */
+function isTorrentPaused(t) {
+  return /^(paused|stopped)/i.test(t.state ?? "");
+}
+
+/** Seeding plus paused/stopped torrents, with pause/resume and confirmed delete. */
+function QbitTorrentTable() {
+  const seeding = useQbitTorrents("seeding");
+  const paused = useQbitTorrents("paused");
   const qbitAction = useQbitAction();
 
-  if (!data?.torrents?.length) {
+  const byHash = new Map();
+  for (const t of [...(seeding.data?.torrents ?? []), ...(paused.data?.torrents ?? [])]) {
+    byHash.set(t.hash, t);
+  }
+  const torrents = Array.from(byHash.values());
+
+  if (!torrents.length) {
     return (
       <div className="py-8 text-center text-sm text-muted-foreground">
-        No {filter === "seeding" ? "seeding" : "queued"} torrents
+        No seeding or paused torrents
       </div>
     );
   }
@@ -204,41 +217,93 @@ function QbitTorrentTable({ filter }) {
           <TableHead>Name</TableHead>
           <TableHead className="w-24">Size</TableHead>
           <TableHead className="w-20">Ratio</TableHead>
+          <TableHead className="w-24">State</TableHead>
           <TableHead className="w-28">Actions</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
-        {data.torrents.map((t) => (
-          <TableRow key={t.hash}>
-            <TableCell className="max-w-md truncate font-medium">{t.name}</TableCell>
-            <TableCell>{formatSize(t.size)}</TableCell>
-            <TableCell>{t.ratio.toFixed(2)}</TableCell>
-            <TableCell>
-              <div className="flex gap-1">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-7"
-                  title="Pause"
-                  disabled={qbitAction.isPending}
-                  onClick={() => qbitAction.mutate({ action: "pause", hashes: [t.hash] })}
-                >
-                  <PauseIcon className="size-3" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-7"
-                  title="Remove from qBit"
-                  disabled={qbitAction.isPending}
-                  onClick={() => qbitAction.mutate({ action: "delete", hashes: [t.hash] })}
-                >
-                  <TrashIcon className="size-3" />
-                </Button>
-              </div>
-            </TableCell>
-          </TableRow>
-        ))}
+        {torrents.map((t) => {
+          const isPaused = isTorrentPaused(t);
+          return (
+            <TableRow key={t.hash}>
+              <TableCell className="max-w-md truncate font-medium">{t.name}</TableCell>
+              <TableCell>{formatSize(t.size)}</TableCell>
+              <TableCell>{(t.ratio ?? 0).toFixed(2)}</TableCell>
+              <TableCell>
+                <Badge variant={isPaused ? "secondary" : "success"}>
+                  {isPaused ? "Paused" : "Seeding"}
+                </Badge>
+              </TableCell>
+              <TableCell>
+                <div className="flex gap-1">
+                  {isPaused ? (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7"
+                      title="Resume"
+                      aria-label={`Resume ${t.name}`}
+                      disabled={qbitAction.isPending}
+                      onClick={() => qbitAction.mutate({ action: "resume", hashes: [t.hash] })}
+                    >
+                      <PlayIcon className="size-3" />
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7"
+                      title="Pause"
+                      aria-label={`Pause ${t.name}`}
+                      disabled={qbitAction.isPending}
+                      onClick={() => qbitAction.mutate({ action: "pause", hashes: [t.hash] })}
+                    >
+                      <PauseIcon className="size-3" />
+                    </Button>
+                  )}
+                  <AlertDialog>
+                    <AlertDialogTrigger
+                      render={
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-7"
+                          title="Remove from qBit"
+                          aria-label={`Remove ${t.name} from qBittorrent`}
+                          disabled={qbitAction.isPending}
+                        />
+                      }
+                    >
+                      <TrashIcon className="size-3" />
+                    </AlertDialogTrigger>
+                    <AlertDialogPopup>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>Remove torrent</AlertDialogTitle>
+                        <AlertDialogDescription>
+                          Remove &quot;{t.name}&quot; from qBittorrent? The downloaded
+                          files are kept on disk; only the torrent entry is removed.
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+                        <AlertDialogClose
+                          render={
+                            <Button
+                              variant="destructive"
+                              onClick={() => qbitAction.mutate({ action: "delete", hashes: [t.hash] })}
+                            />
+                          }
+                        >
+                          Remove
+                        </AlertDialogClose>
+                      </AlertDialogFooter>
+                    </AlertDialogPopup>
+                  </AlertDialog>
+                </div>
+              </TableCell>
+            </TableRow>
+          );
+        })}
       </TableBody>
     </Table>
   );
@@ -350,9 +415,10 @@ export default function Downloads() {
           )}
           <TabsTrigger value="torrent">Torrents</TabsTrigger>
           <TabsTrigger value="usenet">NZBs</TabsTrigger>
-          {stats?.qbittorrent?.configured && stats.qbittorrent.seeding > 0 && (
+          {stats?.qbittorrent?.configured && (
             <TabsTrigger value="seeding">
-              Seeding ({stats.qbittorrent.seeding})
+              Seeding / Paused
+              {stats.qbittorrent.seeding > 0 ? ` (${stats.qbittorrent.seeding})` : ""}
             </TabsTrigger>
           )}
           {(stats?.arr_services ?? ["sonarr", "radarr"]).map((svc) => (
@@ -365,7 +431,7 @@ export default function Downloads() {
           <Card>
             <CardContent className="p-0">
               {tab === "seeding" ? (
-                <QbitTorrentTable filter="seeding" />
+                <QbitTorrentTable />
               ) : (
                 <DownloadTable items={filtered} />
               )}

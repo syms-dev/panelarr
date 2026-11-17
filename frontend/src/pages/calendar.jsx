@@ -10,6 +10,7 @@ import {
   TvIcon,
 } from "lucide-react";
 
+import { CalendarFeedDialog } from "@/components/calendar-feed-dialog";
 import { CalendarAgendaRow } from "@/components/calendar-agenda-row";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -24,6 +25,7 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { useCalendar } from "@/hooks/use-api";
+import { monthRange } from "@/lib/calendar-range";
 import { cn } from "@/lib/utils";
 
 
@@ -31,18 +33,6 @@ const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
-
-function startOfMonth(d) {
-  const x = new Date(d.getFullYear(), d.getMonth(), 1);
-  x.setHours(0, 0, 0, 0);
-  return x;
-}
-
-function endOfMonth(d) {
-  const x = new Date(d.getFullYear(), d.getMonth() + 1, 0);
-  x.setHours(23, 59, 59, 999);
-  return x;
-}
 
 function isoDate(d) {
   const yyyy = d.getFullYear();
@@ -167,8 +157,8 @@ export default function CalendarPage() {
     return d;
   }, []);
 
-  const start = useMemo(() => isoDate(startOfMonth(cursor)), [cursor]);
-  const end = useMemo(() => isoDate(endOfMonth(cursor)), [cursor]);
+  // Local-midnight instants; end is exclusive (midnight after the last day).
+  const { start, end } = useMemo(() => monthRange(cursor), [cursor]);
 
   const { data, isLoading, isError, error } = useCalendar({
     start,
@@ -199,14 +189,15 @@ export default function CalendarPage() {
 
   const monthLabel = `${MONTH_NAMES[cursor.getMonth()]} ${cursor.getFullYear()}`;
 
-  const icsHref = useMemo(() => {
-    const params = new URLSearchParams();
-    params.set("kind", kind);
-    params.set("include_unmonitored", includeUnmonitored ? "true" : "false");
-    params.set("include_specials", includeSpecials ? "true" : "false");
-    params.set("include_downloaded", includeDownloaded ? "true" : "false");
-    return `/api/calendar/feed.ics?${params.toString()}`;
-  }, [kind, includeUnmonitored, includeSpecials, includeDownloaded]);
+  const feedFilters = useMemo(
+    () => ({
+      kind,
+      include_unmonitored: includeUnmonitored ? "true" : "false",
+      include_specials: includeSpecials ? "true" : "false",
+      include_downloaded: includeDownloaded ? "true" : "false",
+    }),
+    [kind, includeUnmonitored, includeSpecials, includeDownloaded],
+  );
 
   return (
     <div className="space-y-6">
@@ -222,20 +213,10 @@ export default function CalendarPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            render={
-              <a
-                href={icsHref}
-                download="panelarr.ics"
-                title="Download an iCalendar feed (subscribe in your calendar app)"
-              />
-            }
-          >
+          <CalendarFeedDialog filters={feedFilters}>
             <DownloadIcon className="mr-1.5 size-3.5" />
             ICS
-          </Button>
+          </CalendarFeedDialog>
           <Button variant="outline" size="sm" onClick={goToday}>
             Today
           </Button>

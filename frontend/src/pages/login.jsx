@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { LogInIcon } from "lucide-react";
 
 import Logo from "@/components/logo";
@@ -10,10 +10,19 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
 import { useAuth } from "@/hooks/use-auth";
+import { safeNextPath } from "@/lib/api";
 
+/**
+ * Login page. Renders username/password in basic mode and a single API-key
+ * field in apikey mode. Honours a validated same-origin ?next= return path.
+ */
 export default function Login() {
-  const { login, isAuthenticated } = useAuth();
+  const { login, isAuthenticated, mode } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const nextPath = safeNextPath(searchParams.get("next")) ?? "/";
+  const isApiKeyMode = mode === "apikey";
+  const [apiKey, setApiKey] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -21,9 +30,9 @@ export default function Login() {
 
   useEffect(() => {
     if (isAuthenticated) {
-      navigate("/", { replace: true });
+      navigate(nextPath, { replace: true });
     }
-  }, [isAuthenticated, navigate]);
+  }, [isAuthenticated, navigate, nextPath]);
 
   if (isAuthenticated) return null;
 
@@ -32,8 +41,8 @@ export default function Login() {
     setError("");
     setIsSubmitting(true);
     try {
-      await login(username, password);
-      navigate("/", { replace: true });
+      await login(isApiKeyMode ? { api_key: apiKey } : { username, password });
+      navigate(nextPath, { replace: true });
     } catch (err) {
       setError(err.message || "Login failed");
     } finally {
@@ -56,6 +65,22 @@ export default function Login() {
                 <AlertDescription>{error}</AlertDescription>
               </Alert>
             )}
+            {isApiKeyMode ? (
+              <div className="space-y-2">
+                <Label htmlFor="api-key">API key</Label>
+                <Input
+                  id="api-key"
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="Paste your API key"
+                  autoComplete="off"
+                  autoFocus
+                  required
+                />
+              </div>
+            ) : (
+              <>
             <div className="space-y-2">
               <Label htmlFor="username">Username</Label>
               <Input
@@ -81,6 +106,8 @@ export default function Login() {
                 required
               />
             </div>
+              </>
+            )}
             <Button type="submit" className="w-full" disabled={isSubmitting}>
               {isSubmitting ? (
                 <Spinner className="size-4" />
