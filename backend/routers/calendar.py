@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query
@@ -14,29 +15,43 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/calendar", tags=["calendar"])
 
 
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SPACE_OFFSET_RE = re.compile(r"^(.+T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?) (\d{2}:?\d{2})$")
+
+
 def _parse_date(value: str | None, *, fallback: datetime) -> datetime:
+    """Parse a ``start``/``end`` query value into an absolute UTC instant.
+
+    Accepts a bare ``YYYY-MM-DD`` (00:00 UTC of that day) or a full ISO-8601
+    datetime with ``Z``/offset (an absolute instant). A naive datetime is taken
+    as UTC. An unescaped ``+`` in an offset arrives as a space and is repaired.
+    """
     if not value:
         return fallback
+    value = value.strip()
     try:
-        # Accept either a bare date (YYYY-MM-DD) or full ISO-8601
-        if len(value) == 10:
-            dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
-        else:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=UTC)
-        return dt
+        if _DATE_ONLY_RE.match(value):
+            return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
+        fixed = _SPACE_OFFSET_RE.sub(r"\1+\2", value)
+        dt = datetime.fromisoformat(fixed.replace("Z", "+00:00").replace("z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid date '{value}': expected YYYY-MM-DD or ISO-8601",
+            detail=f"Invalid date '{value[:40]}': expected YYYY-MM-DD or ISO-8601",
         ) from exc
 
 
 @router.get("")
 async def list_calendar(
-    start: str | None = Query(None, description="ISO-8601 or YYYY-MM-DD (UTC)"),
-    end: str | None = Query(None, description="ISO-8601 or YYYY-MM-DD (UTC)"),
+    start: str | None = Query(
+        None, description="YYYY-MM-DD (00:00 UTC) or ISO-8601 datetime with offset/Z"
+    ),
+    end: str | None = Query(
+        None, description="Exclusive end: YYYY-MM-DD (00:00 UTC) or ISO-8601 datetime with offset/Z"
+    ),
     kind: str = Query("all", pattern="^(all|episodes|movies|episode|movie)$"),
     include_unmonitored: bool = Query(True),
     include_specials: bool = Query(False),
@@ -44,7 +59,8 @@ async def list_calendar(
 ) -> dict:
     """Unified calendar across configured ARR services.
 
-    Defaults to a 35-day window starting today (covers a full month grid).
+    The window is ``[start, end)``: ``end`` is exclusive. Defaults to a 35-day
+    window starting today (covers a full month grid).
     Specials (Sonarr season 0) are hidden by default to match the show
     detail view. Downloaded items are included by default; disable to
     focus on what's still pending.
