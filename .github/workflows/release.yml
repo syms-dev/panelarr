@@ -55,3 +55,21 @@ jobs:
             --title "${{ steps.version.outputs.tag }}" \
             --notes-file release_notes.md \
             ${prerelease_flag}
+
+      # panelarr.dev reads the latest release at build time, so rebuilding it
+      # is all it takes to show the new version. Needs two repository secrets:
+      # COOLIFY_WEBHOOK (the site's Deploy Webhook URL in Coolify) and
+      # COOLIFY_TOKEN (a Coolify API token with deploy permission).
+      - name: Rebuild panelarr.dev
+        env:
+          COOLIFY_WEBHOOK: ${{ secrets.COOLIFY_WEBHOOK }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+        run: |
+          if [ -z "${COOLIFY_WEBHOOK}" ] || [ -z "${COOLIFY_TOKEN}" ]; then
+            echo "::warning::COOLIFY_WEBHOOK or COOLIFY_TOKEN is not set, so panelarr.dev was not rebuilt."
+            exit 0
+          fi
+          if ! curl --fail-with-body -sS --max-time 60 \
+              -H "Authorization: Bearer ${COOLIFY_TOKEN}" "${COOLIFY_WEBHOOK}"; then
+            echo "::warning::The panelarr.dev rebuild request failed; redeploy the site in Coolify."
+          fi

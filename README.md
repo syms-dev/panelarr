@@ -88,7 +88,7 @@ Available tags:
 | Tag | Source | Use when |
 |---|---|---|
 | `latest` | last `v*.*.*` release | production |
-| `v0.1.0-alpha` | exact release tag | pinning to a specific version |
+| `0.4.0-alpha` | exact release (no `v` prefix) | pinning to a specific version |
 | `dev` | every push to `develop` | living on the edge |
 
 Traefik users: see [docs/configuration.md](docs/configuration.md) for network and label setup, including Saltbox and Authelia.
