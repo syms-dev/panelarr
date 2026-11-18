@@ -142,6 +142,8 @@ and from a verified security sweep of the fixed branch (`docs/audits/2026-11-17-
 - Calendar: last day of the month and timezone edges no longer dropped; air
   dates no longer shown a day early in the Americas; the ICS feed has a
   subscribe URL with a token.
+- The poster cache's first cleanup no longer waits a minute after the host
+  boots (the throttle started from 0 on a clock that counts from boot).
 - Delete/blocklist/qBit actions report failures; the poster cache follows the
   config directory; container label links only allow http(s); keyboard
   activation of link buttons; logout leaves the dashboard immediately.

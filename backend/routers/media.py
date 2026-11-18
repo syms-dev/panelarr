@@ -38,7 +38,7 @@ POSTER_TIMEOUT = 10
 POSTER_CACHE_MAX_BYTES = 500 * 1024 * 1024
 POSTER_EVICT_INTERVAL = 60.0  # seconds between eviction sweeps
 
-_last_evict_at: float = 0.0
+_last_evict_at: float | None = None  # None: no sweep yet
 
 
 def poster_cache_dir() -> Path:
@@ -79,7 +79,9 @@ def _should_evict() -> bool:
     """Throttle eviction sweeps to once per POSTER_EVICT_INTERVAL."""
     global _last_evict_at
     now = time.monotonic()
-    if now - _last_evict_at >= POSTER_EVICT_INTERVAL:
+    # monotonic() counts from boot on Linux, so a 0.0 start would skip the first
+    # sweep for a minute after the host boots.
+    if _last_evict_at is None or now - _last_evict_at >= POSTER_EVICT_INTERVAL:
         _last_evict_at = now
         return True
     return False

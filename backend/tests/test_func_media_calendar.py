@@ -148,6 +148,14 @@ def test_eviction_removes_oldest_first_and_is_throttled(
     media._evict_poster_cache(max_bytes=150)
     assert [p.name for p in cache.iterdir()] == ["new.jpg"]
 
-    media._last_evict_at = 0.0
+    media._last_evict_at = None
+    assert media._should_evict() is True
+    assert media._should_evict() is False
+
+
+def test_first_eviction_runs_right_after_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """monotonic() starts near 0 on a freshly booted host; the first sweep must still run."""
+    monkeypatch.setattr(media, "_last_evict_at", None)
+    monkeypatch.setattr(media.time, "monotonic", lambda: 5.0)
     assert media._should_evict() is True
     assert media._should_evict() is False
