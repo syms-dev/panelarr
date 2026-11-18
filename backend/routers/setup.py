@@ -5,7 +5,8 @@ import uuid
 from importlib.metadata import version as _pkg_version
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from backend.routers.system import _collect_disks
 from backend.services.auth_config import (
@@ -18,6 +19,7 @@ from backend.services.auth_config import (
     set_auth_in_config,
 )
 from backend.services.config import (
+    AUTH_MODES,
     PanelarrConfig,
     load_config,
     resolve_config_path,
@@ -186,18 +188,37 @@ class AuthBody(BaseModel):
     password: str | None = None
     proxy_header: str | None = None
     api_key: str | None = None
-
-
-_VALID_MODES = {"none", "basic", "proxy", "apikey"}
+    trusted_proxies: list[str] | None = None
 
 
 @router.post("/auth")
-async def setup_auth(body: AuthBody) -> dict:
-    """Configure authentication mode and credentials."""
+async def setup_auth(body: AuthBody, request: Request) -> JSONResponse:
+    """Configure authentication mode and credentials.
+
+    Once this step is saved, every other setup endpoint requires the new
+    credentials, so for basic and apikey modes the response signs the user in.
+    """
+    from backend.routers.auth import (
+        _validated_cidrs,
+        issue_session,
+        proxy_hosts_with,
+        require_proxy_auth_on,
+    )
+    from backend.services.auth import APIKEY_SESSION_SUB
+
     _require_setup_incomplete()
 
-    if body.mode not in _VALID_MODES:
+    if body.mode not in AUTH_MODES:
         raise HTTPException(status_code=422, detail=f"Invalid mode: {body.mode!r}")
+
+    # This endpoint is unauthenticated until a mode is saved, so nothing may
+    # be written before the request is fully validated: the trusted-proxy list
+    # is only accepted with proxy mode and saved together with it.
+    if body.trusted_proxies is not None and body.mode != "proxy":
+        raise HTTPException(
+            status_code=422, detail="trusted_proxies can only be set with proxy mode"
+        )
+    trusted = _validated_cidrs(body.trusted_proxies)
 
     if body.mode == "basic":
         if not body.username or not body.password:
@@ -209,22 +230,32 @@ async def setup_auth(body: AuthBody) -> dict:
             set_auth_in_config(mode="basic", username=body.username, password=body.password)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {"ok": True}
+        response = JSONResponse(content={"ok": True})
+        issue_session(response, request, body.username)
+        return response
 
     if body.mode == "proxy":
-        header = body.proxy_header or "Remote-User"
-        set_auth_in_config(mode="proxy", proxy_header=header)
-        return {"ok": True}
+        header = (body.proxy_header or "Remote-User").strip()
+        to_trust = require_proxy_auth_on(request, header, trusted)
+        set_auth_in_config(
+            mode="proxy",
+            proxy_header=header,
+            trusted_proxies=to_trust,
+            proxy_hosts=proxy_hosts_with(request),
+        )
+        return JSONResponse(content={"ok": True})
 
     if body.mode == "apikey":
         generated_key = secrets.token_urlsafe(32)
         set_auth_in_config(mode="apikey", api_key=generated_key)
         # Returned only once, client must store it
-        return {"ok": True, "api_key": generated_key}
+        response = JSONResponse(content={"ok": True, "api_key": generated_key})
+        issue_session(response, request, APIKEY_SESSION_SUB)
+        return response
 
     # mode == "none"
     set_auth_in_config(mode="none")
-    return {"ok": True}
+    return JSONResponse(content={"ok": True})
 
 
 @router.get("/discover")
@@ -321,9 +352,9 @@ async def setup_notifications(body: NotificationBody) -> dict:
 
 
 class ThresholdsBody(BaseModel):
-    disk_warn_pct: int = 85
-    disk_crit_pct: int = 90
-    watchdog_threshold_hours: int = 2
+    disk_warn_pct: int = Field(default=85, ge=1, le=100)
+    disk_crit_pct: int = Field(default=90, ge=1, le=100)
+    watchdog_threshold_hours: int = Field(default=2, ge=1, le=720)
 
 
 @router.post("/thresholds")
@@ -333,7 +364,10 @@ async def setup_thresholds(body: ThresholdsBody) -> dict:
 
     config = load_config()
     data = config.model_dump()
-    data["thresholds"] = body.model_dump()
+    # Merge, so the disk selection saved by the system-check step survives.
+    thresholds = dict(data.get("thresholds", {}))
+    thresholds.update(body.model_dump())
+    data["thresholds"] = thresholds
     save_config(PanelarrConfig(**data))
     return {"ok": True}
 

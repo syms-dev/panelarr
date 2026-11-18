@@ -15,6 +15,7 @@ export default function SetupAuth() {
   const setupAuth = useSetupAuth();
   const [generatedKey, setGeneratedKey] = useState(null);
   const [isAdvancing, setIsAdvancing] = useState(false);
+  const [authError, setAuthError] = useState("");
 
   const isReadOnly = status?.auth_writable === false;
   const detectedProxy = status?.detected_proxy ?? null;
@@ -54,6 +55,7 @@ export default function SetupAuth() {
   }
 
   function handleAuthChange(next) {
+    setAuthError("");
     // Reset the generated apikey if the user switches modes away from apikey
     if (next.mode !== "apikey" && generatedKey) {
       setGeneratedKey(null);
@@ -68,6 +70,7 @@ export default function SetupAuth() {
     }
 
     setIsAdvancing(true);
+    setAuthError("");
     try {
       if (auth.mode === "basic") {
         if (!auth.username || !auth.password) {
@@ -98,6 +101,9 @@ export default function SetupAuth() {
       }
       goNext();
     } catch (err) {
+      // Proxy mode: the backend returns 422 with a detail when this request
+      // did not arrive through a trusted proxy carrying the auth header.
+      setAuthError(err.message);
       toastManager.add({
         type: "error",
         title: "Failed to save auth settings",
@@ -127,6 +133,7 @@ export default function SetupAuth() {
         apiKey={generatedKey}
         onGenerateApiKey={handleGenerateKey}
         isGeneratingApiKey={setupAuth.isPending}
+        error={authError}
       />
 
       <div className="flex items-center justify-between pt-2">

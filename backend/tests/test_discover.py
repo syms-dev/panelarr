@@ -129,11 +129,11 @@ def test_suggested_url_with_slash_prefix() -> None:
 
 
 def test_suggested_url_non_default_host_port() -> None:
-    # Host port is remapped to 19898, but we still use container name + default for Docker DNS
+    # Host port is remapped to 19898; on the Docker network the container's internal
+    # port (8989) is what must be used (this test previously encoded the opposite bug).
     container = {"name": "sonarr", "ports": {"8989/tcp": 19898}}
     url = suggested_url(container, "sonarr")
-    # When port is remapped we surface the remapped port
-    assert url == "http://sonarr:19898"
+    assert url == "http://sonarr:8989"
 
 
 def test_match_multiple_containers() -> None:
