@@ -8,9 +8,6 @@ logger = logging.getLogger(__name__)
 
 VERSION = _pkg_version("panelarr")
 
-_VALID_AUTH_MODES = {"none", "basic", "proxy", "apikey"}
-
-
 #
 # All auth values live in panelarr.json. There is no env-var override:
 # the setup wizard writes them, the Settings page updates them, and the
@@ -19,14 +16,18 @@ _VALID_AUTH_MODES = {"none", "basic", "proxy", "apikey"}
 
 
 def get_effective_auth_mode() -> str:
-    """Return the configured auth mode, defaulting to 'none'."""
-    from backend.services.config import load_config
+    """Return the configured auth mode, 'none' when no mode has been chosen.
+
+    ``load_config`` already rejects an unknown mode with ``ConfigError``; the
+    check is repeated here so no code path can turn an unknown mode into
+    "no auth".
+    """
+    from backend.services.config import AUTH_MODES, ConfigError, load_config
 
     config = load_config()
-    mode = config.auth.get("mode", "none") if config.auth else "none"  # type: ignore[union-attr]
-    if mode not in _VALID_AUTH_MODES:
-        logger.warning("Invalid auth mode %r in config, falling back to 'none'", mode)
-        return "none"
+    mode = (config.auth or {}).get("mode", "none")
+    if mode not in AUTH_MODES:
+        raise ConfigError("auth.mode is not a known authentication mode")
     return mode
 
 
@@ -86,28 +87,45 @@ def set_auth_in_config(
     password: str | None = None,
     proxy_header: str | None = None,
     api_key: str | None = None,
+    trusted_proxies: list[str] | None = None,
+    proxy_hosts: list[str] | None = None,
+    calendar_token: str | None = None,
 ) -> None:
     """Write auth fields to panelarr.json, preserving existing auth.secret.
 
-    Only non-None arguments are written. Password is bcrypt-hashed before storage.
+    Only non-None arguments are written. Password is bcrypt-hashed before
+    storage. Changing the password, the username or the API key rotates the
+    session signing secret, which logs out every other session.
     """
-    from backend.services.auth import hash_password
+    from backend.services.auth import hash_password, rotate_secret
     from backend.services.config import load_config, save_config
 
     config = load_config()
     # config.auth is a plain dict, preserve existing fields (e.g. secret)
     auth: dict = dict(config.auth) if config.auth else {}  # type: ignore[arg-type]
 
+    rotate = False
     if mode is not None:
         auth["mode"] = mode
     if username is not None:
+        rotate = rotate or auth.get("username") != username
         auth["username"] = username
     if password is not None:
         auth["password_hash"] = hash_password(password)
+        rotate = True
     if proxy_header is not None:
         auth["proxy_header"] = proxy_header
     if api_key is not None:
         auth["api_key"] = api_key
+        rotate = True
+    if trusted_proxies is not None:
+        auth["trusted_proxies"] = trusted_proxies
+    if proxy_hosts is not None:
+        auth["proxy_hosts"] = proxy_hosts
+    if calendar_token is not None:
+        auth["calendar_token"] = calendar_token
+    if rotate and auth.get("secret"):
+        rotate_secret(auth)
 
     # Rebuild config with updated auth block
     data = config.model_dump()
@@ -117,42 +135,78 @@ def set_auth_in_config(
     save_config(PanelarrConfig(**data))
 
 
+def get_trusted_proxies() -> list[str]:
+    from backend.services.security import get_trusted_proxies as _get
+
+    return _get()
+
+
+def get_or_create_calendar_token() -> str:
+    """Return the read-only token that authorises the ICS feed URL."""
+    from backend.services.config import load_config
+
+    config = load_config()
+    token = (config.auth or {}).get("calendar_token", "")
+    if token:
+        return token
+    import secrets
+
+    token = secrets.token_urlsafe(24)
+    set_auth_in_config(calendar_token=token)
+    return token
+
+
+def is_auth_configured() -> bool:
+    """True once the wizard's auth step has been saved (or setup is done).
+
+    Until then only the setup endpoints are reachable, so a freshly started
+    instance exposes nothing but the wizard. Legacy installs that predate the
+    wizard count as configured once ``is_setup_complete`` backfills them.
+    """
+    from backend.services.config import load_config
+
+    config = load_config()
+    if (config.auth or {}).get("mode"):
+        return True
+    return is_setup_complete()
+
+
 def is_setup_complete() -> bool:
-    """True iff config['setup']['completed_at'] is set.
+    """True iff config['setup']['completed_at'] is set. Never writes."""
+    from backend.services.config import load_config
 
-    Backfill: only on the *first observation* of a *legacy* install
-    (setup dict is empty, services are already configured, AND the wizard
-    has not started writing the auth block) do we auto-write
-    setup.completed_at = 'auto-migrated' so existing users skip the wizard.
+    config = load_config()
+    setup: dict = config.setup if config.setup else {}  # type: ignore[assignment]
+    return bool(setup.get("completed_at"))
 
-    The auth-block check is what distinguishes a legacy install from a
-    wizard mid-flight: the wizard always writes auth before services, so
-    once `auth.mode` is present we know we're inside an active wizard and
-    must not short-circuit it. After a reset, setup contains a 'reset_at'
-    sentinel which also prevents re-backfilling.
+
+def backfill_legacy_setup() -> bool:
+    """Mark a pre-wizard install as set up. Call once at startup only.
+
+    A legacy install (services configured, no ``setup`` block, no auth mode)
+    predates the wizard and must not be sent back through it. This runs from
+    the app lifespan, before any request is served, so it only ever looks at
+    the config file as it existed when the process started. Running it from a
+    request path would let an unauthenticated client on a fresh install save
+    a service and have the instance "auto-migrated" into auth mode none.
+    After a reset, ``setup`` holds a 'reset_at' sentinel, which also prevents
+    backfilling.
     """
     from backend.services.config import PanelarrConfig, load_config, save_config
 
     config = load_config()
     setup: dict = config.setup if config.setup else {}  # type: ignore[assignment]
-
-    if setup.get("completed_at"):
-        return True
-
     auth_block: dict = config.auth if config.auth else {}  # type: ignore[assignment]
-    wizard_in_progress = bool(auth_block.get("mode"))
-
-    if not setup and config.services and not wizard_in_progress:
-        logger.info(
-            "Backfilling setup.completed_at for existing installation (%d service(s) configured)",
-            len(config.services),
-        )
-        data = config.model_dump()
-        data["setup"] = {"completed_at": "auto-migrated", "version": VERSION}
-        save_config(PanelarrConfig(**data))
-        return True
-
-    return False
+    if setup or not config.services or auth_block.get("mode"):
+        return False
+    logger.info(
+        "Backfilling setup.completed_at for existing installation (%d service(s) configured)",
+        len(config.services),
+    )
+    data = config.model_dump()
+    data["setup"] = {"completed_at": "auto-migrated", "version": VERSION}
+    save_config(PanelarrConfig(**data))
+    return True
 
 
 def mark_setup_complete() -> None:

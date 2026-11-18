@@ -212,6 +212,7 @@ function UserSection() {
                 size="icon"
                 className="size-7"
                 onClick={logout}
+                aria-label="Sign out"
               />
             }
           >
