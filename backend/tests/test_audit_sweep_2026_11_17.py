@@ -536,7 +536,7 @@ def test_route_table_gateways(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 
 
 # ---------------------------------------------------------------------------
-# Claude-BugHunter run of 2026-11-17 (findings verified and fixed the same day)
+# BugHunter run of 2026-11-17 (findings verified and fixed the same day)
 # ---------------------------------------------------------------------------
 
 REBIND = "http://rebind.attacker.test:8000"
@@ -720,7 +720,7 @@ async def test_unsearchable_config_dir_fails_closed(unsearchable_config_dir: Pat
     assert not (unsearchable_config_dir.parent.parent / "home").exists()
 
 
-# Hardening from the Claude-BugHunter record (docs/audits/bughunter-2026-11-17.md).
+# Hardening from the BugHunter record (docs/audits/bughunter-2026-11-17.md).
 
 
 async def test_http_origin_refused_when_served_over_https(config_path: Path) -> None:

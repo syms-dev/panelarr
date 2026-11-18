@@ -20,7 +20,7 @@ Commit: 2c08b9ca107c889e896874630396ea8bd91988cd
 
 ## Delegation
 
-One read-only reviewer (agent type `claude-kit:owasp-reviewer`, fresh context) for this zone, run in
+One read-only reviewer (OWASP reviewer, fresh context) for this zone, run in
 parallel with four other zone reviewers. Brief: the skill's brief adapted to Panelarr (pre-read of
 `CONTRIBUTING.md`, README "Security", `docs/configuration.md` "Authentication" to "Outbound
 requests", `docs/audits/categories.md`, the 2026-11-16 audit with what it and the follow-up review

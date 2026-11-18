@@ -1,13 +1,13 @@
-# Claude-BugHunter run, 2026-11-17
+# BugHunter run, 2026-11-17
 
 A second, independent pass after the [verified security sweep](sweep-registry.md) of the same day,
-using the skills of [Claude-BugHunter](https://github.com/elementalsouls/Claude-BugHunter) (commit
+using the BugHunter methodology by elementalsouls (commit
 `5d91c81`, read from a clone, not installed). Mode: WAPT grey-box with `--source-code`, against
 local instances of this branch (sweep fixes applied) on 127.0.0.1 with loopback-only mock Docker,
 registry and upstream services. Three hunters (auth and sessions; browser trust boundary; server-side
 requests, files and injection) plus a static pass by the owner's session. Every finding below was
 reproduced by the session before it was fixed, and each has a regression test in
-`backend/tests/test_audit_sweep_2026_11_17.py` (section "Claude-BugHunter run").
+`backend/tests/test_audit_sweep_2026_11_17.py` (section "BugHunter run").
 
 Scope note: one early scenario used real image names, so a single update check sent anonymous
 manifest and token requests to public registries (lscr.io, ghcr.io, Docker Hub) before the mocks

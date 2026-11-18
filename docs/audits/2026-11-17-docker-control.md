@@ -15,7 +15,7 @@ Commit: 2c08b9ca107c889e896874630396ea8bd91988cd
 
 ## Delegation
 
-One read-only reviewer (`claude-kit:owasp-reviewer`, fresh context) with the shared brief (pre-read
+One read-only reviewer (OWASP reviewer, fresh context) with the shared brief (pre-read
 of the rules, categories, the 2026-11-16 audit and the follow-up closures, test names) and zone
 lenses: `_guard_critical` bypasses, sidecar command construction and env handling, rollback and
 downgrade refusal, registry token realm and image references, log WebSocket auth and counters,

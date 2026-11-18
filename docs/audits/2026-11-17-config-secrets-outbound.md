@@ -14,7 +14,7 @@ Commit: 2c08b9ca107c889e896874630396ea8bd91988cd
 
 ## Delegation
 
-One read-only reviewer (`claude-kit:owasp-reviewer`, fresh context) with the shared brief and zone
+One read-only reviewer (OWASP reviewer, fresh context) with the shared brief and zone
 lenses: masking completeness, masked-value round trips and URL origin normalisation,
 `PROTECTED_KEYS`, write atomicity and file modes, fail-closed edge cases, SSRF guard bypasses
 (rebinding, redirects, IPv6 forms, numeric IPv4 forms), unguarded outbound call sites, SMTP, log

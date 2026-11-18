@@ -13,7 +13,7 @@ Commit: 2c08b9ca107c889e896874630396ea8bd91988cd
 
 ## Delegation
 
-One read-only reviewer (`claude-kit:owasp-reviewer`, fresh context) with the shared brief and zone
+One read-only reviewer (OWASP reviewer, fresh context) with the shared brief and zone
 lenses: ICS feed token scope, comparison, regeneration and leakage; ICS injection; poster and
 thumbnail proxying (SSRF, path traversal, content type, cache growth); ids interpolated into
 upstream URLs; upstream HTML returned as HTML; destructive actions on GET. It returned 1 finding,
