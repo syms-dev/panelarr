@@ -53,6 +53,7 @@ import {
   useVersionCheck,
 } from "@/hooks/use-api";
 import { CalendarAgendaRow } from "@/components/calendar-agenda-row";
+import { localDayRange } from "@/lib/calendar-range";
 import { cn, formatBytes } from "@/lib/utils";
 import { useUpdate } from "@/hooks/use-update";
 
@@ -103,6 +104,20 @@ function StatCard({ icon: Icon, label, value, subValue, variant }) {
       </CardContent>
     </Card>
   );
+}
+
+/**
+ * Build stable React keys for Plex streams (the API exposes no session id),
+ * from user/device/title/address, suffixing duplicates with a counter.
+ */
+function streamEntries(streams) {
+  const seen = new Map();
+  return streams.map((stream) => {
+    const base = [stream.user, stream.device, stream.title, stream.address].join("|");
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    return { key: n === 0 ? base : `${base}#${n}`, stream };
+  });
 }
 
 function StreamCard({ stream }) {
@@ -234,16 +249,20 @@ export default function Dashboard() {
   const blocklistAll = useBlocklistWarnings();
 
   // Upcoming releases, query the next 30 days and slice to the soonest 5
-  const upcomingWindow = useMemo(() => {
-    const now = new Date();
-    const start = new Date(now);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(start);
-    end.setDate(start.getDate() + 30);
-    const fmt = (d) =>
-      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-    return { start: fmt(start), end: fmt(end), nowMs: now.getTime() };
+  // A minute tick keeps the window fresh on long-lived tabs.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => clearInterval(id);
   }, []);
+  const today = new Date(nowMs);
+  const windowStartDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const windowEndDay = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 30);
+  const { start: windowStart, end: windowEnd } = localDayRange(windowStartDay, windowEndDay);
+  const upcomingWindow = useMemo(
+    () => ({ start: windowStart, end: windowEnd, nowMs }),
+    [windowStart, windowEnd, nowMs],
+  );
   // Match the calendar page defaults: hide specials, hide downloaded, and
   // skip unmonitored items so the widget surfaces only what the user is
   // actually waiting on.
@@ -287,6 +306,7 @@ export default function Dashboard() {
 
   // Media streams
   const plexStreams = media?.plex?.streams ?? [];
+  const streamKeys = streamEntries(plexStreams);
   const plexConfigured = media?.plex?.configured;
 
   // Library counts, combine ARR stats and Plex counts
@@ -457,8 +477,8 @@ export default function Dashboard() {
                   <p className="text-sm text-muted-foreground">No active streams</p>
                 ) : (
                   <div className="space-y-3">
-                    {plexStreams.map((stream, i) => (
-                      <StreamCard key={i} stream={stream} />
+                    {streamKeys.map(({ key, stream }) => (
+                      <StreamCard key={key} stream={stream} />
                     ))}
                   </div>
                 )}
@@ -474,8 +494,8 @@ export default function Dashboard() {
                   <CalendarDaysIcon className="size-4" />
                   Upcoming
                 </CardTitle>
-                <Button variant="ghost" size="sm" asChild>
-                  <Link to="/calendar">View calendar →</Link>
+                <Button variant="ghost" size="sm" render={<Link to="/calendar" />}>
+                  View calendar →
                 </Button>
               </CardHeader>
               <CardContent>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import platform
@@ -10,13 +11,14 @@ from importlib.metadata import version as pkg_version
 
 import httpx
 import psutil
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
-from backend.config import settings
 from backend.services.config import get_service_config, load_config
-from backend.services.docker import get_docker_version, list_containers
+from backend.services.docker import get_docker_info, get_docker_version, list_containers
 from backend.services.media import get_emby_stats, get_jellyfin_stats, get_plex_stats
+from backend.services.security import RASTER_IMAGE_TYPES
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -87,6 +89,11 @@ def _collect_disks(filter_by_config: bool = True) -> list[dict]:
             continue
         if any(mp.startswith(p) for p in _SKIP_PREFIXES):
             continue
+        # Docker file bind-mounts appear as partitions; they are not disks.
+        # os.path.isdir, not Path.is_dir: before Python 3.14 the latter raises
+        # PermissionError on a mountpoint this user can't reach.
+        if not os.path.isdir(mp):
+            continue
         _try_add(mp)
 
     # Strip internal _dev field before returning
@@ -119,7 +126,7 @@ async def health_check() -> dict:
     running = sum(1 for c in containers if c.get("state") == "running")
     total = len(containers)
 
-    disks = _collect_disks()
+    disks = await asyncio.to_thread(_collect_disks)
 
     disk_warning = any(d["pct"] >= config.thresholds.get("disk_warn_pct", 85) for d in disks)
     disk_critical = any(d["pct"] >= config.thresholds.get("disk_crit_pct", 90) for d in disks)
@@ -169,15 +176,24 @@ async def health_check() -> dict:
     }
 
 
+def _psutil_snapshot() -> dict:
+    """Collect blocking psutil readings (run via asyncio.to_thread)."""
+    return {
+        "mem": psutil.virtual_memory(),
+        "swap": psutil.swap_memory(),
+        "cpu_freq": psutil.cpu_freq(),
+        "cpu_pct": psutil.cpu_percent(interval=0),
+        "net": psutil.net_io_counters(),
+        "disk_io": psutil.disk_io_counters(),
+    }
+
+
 @router.get("/info")
 async def system_info() -> dict:
     docker_ver = await get_docker_version()
-    mem = psutil.virtual_memory()
-    swap = psutil.swap_memory()
-    cpu_freq = psutil.cpu_freq()
-    cpu_pct = psutil.cpu_percent(interval=0)
-    net = psutil.net_io_counters()
-    disk_io = psutil.disk_io_counters()
+    snap = await asyncio.to_thread(_psutil_snapshot)
+    mem, swap, cpu_freq = snap["mem"], snap["swap"], snap["cpu_freq"]
+    cpu_pct, net, disk_io = snap["cpu_pct"], snap["net"], snap["disk_io"]
 
     return {
         "hostname": platform.node(),
@@ -208,23 +224,19 @@ async def system_info() -> dict:
 
 
 async def _get_host_os() -> str:
-    """Get host OS name from Docker daemon info (not the container's OS)."""
+    """Get host OS name from Docker daemon info (not the container's OS).
+
+    Only a successful lookup is cached; a failure falls back to the container's
+    platform string without poisoning the cache, so a later call can retry.
+    """
     global _host_os_cache
     if _host_os_cache is not None:
         return _host_os_cache
-    try:
-        async with httpx.AsyncClient(
-            transport=httpx.AsyncHTTPTransport(uds=settings.docker_socket), timeout=5
-        ) as client:
-            resp = await client.get("http://localhost/v1.44/info")
-            if resp.status_code == 200:
-                info = resp.json()
-                _host_os_cache = info.get("OperatingSystem", platform.platform())
-                return _host_os_cache
-    except Exception:
-        pass
-    _host_os_cache = platform.platform()
-    return _host_os_cache
+    info = await get_docker_info()
+    if info and info.get("OperatingSystem"):
+        _host_os_cache = str(info["OperatingSystem"])
+        return _host_os_cache
+    return platform.platform()
 
 
 def _get_cpu_model() -> str:
@@ -247,7 +259,7 @@ def _get_cpu_model() -> str:
 @router.get("/disk")
 async def disk_usage() -> list[dict]:
     config = load_config()
-    disks = _collect_disks()
+    disks = await asyncio.to_thread(_collect_disks)
     for d in disks:
         d["warn"] = d["pct"] >= config.thresholds.get("disk_warn_pct", 85)
         d["critical"] = d["pct"] >= config.thresholds.get("disk_crit_pct", 90)
@@ -263,7 +275,7 @@ async def all_disks() -> dict:
     same shape, but is gated to incomplete-setup only.
     """
     config = load_config()
-    disks = _collect_disks(filter_by_config=False)
+    disks = await asyncio.to_thread(_collect_disks, filter_by_config=False)
     selected = list(config.thresholds.get("disks") or [])
     return {"disks": disks, "selected": selected}
 
@@ -319,10 +331,11 @@ async def discord_health_check() -> dict:
         ],
     }
 
-    from backend.services.notifications import _is_safe_url
+    from backend.services.security import check_outbound_url
 
-    if not _is_safe_url(webhook_url):
-        return {"ok": False, "message": "Webhook URL blocked by security policy"}
+    blocked = await check_outbound_url(webhook_url)
+    if blocked:
+        return {"ok": False, "message": f"Webhook URL blocked: {blocked}"}
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -374,11 +387,14 @@ async def plex_thumbnail(path: str) -> Response:
                     "X-Plex-Token": token,
                 },
             )
-            if resp.status_code == 200:
+            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            # Raster images only: an SVG or HTML answer would run in Panelarr's origin
+            # if opened directly.
+            if resp.status_code == 200 and content_type in RASTER_IMAGE_TYPES:
                 return Response(
                     content=resp.content,
-                    media_type=resp.headers.get("content-type", "image/jpeg"),
-                    headers={"Cache-Control": "public, max-age=3600"},
+                    media_type=content_type,
+                    headers={"Cache-Control": "private, max-age=3600"},
                 )
     except Exception:
         pass
@@ -404,7 +420,7 @@ _cached_latest: dict | None = None
 _cached_latest_at: float = 0.0
 _VERSION_CHECK_TTL = 3600  # cache for 1 hour
 
-GHCR_IMAGE = "thug-drama/panelarr"
+GHCR_IMAGE = "syms-dev/panelarr"
 
 
 def _parse_semver(v: str) -> tuple[int, ...]:
@@ -467,17 +483,44 @@ async def version_check() -> dict:
         return {"current": current, "latest": current, "update_available": False}
 
 
+class SelfUpdateRequest(BaseModel):
+    """Optional body for ``POST /api/system/self-update``."""
+
+    version: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=r"^v?\d+(\.\d+){1,3}([.-][0-9A-Za-z.-]+)?$",
+        description="Release to move a version-pinned image tag to (default: newest release).",
+    )
+
+
 @router.post("/self-update")
-async def self_update_endpoint() -> dict:
-    """Pull the latest GHCR image and safely recreate the panelarr container.
+async def self_update_endpoint(body: SelfUpdateRequest | None = None) -> dict:
+    """Pull the new GHCR image and safely recreate the panelarr container.
 
     Pulls the new image first, then launches an ephemeral ``docker:cli``
     sidecar container via the Docker socket. The sidecar runs outside the
-    panelarr process tree so it can stop, remove, and recreate this container
-    after the HTTP response has been sent. The frontend should poll
-    ``GET /api/system/health`` until it gets a 200 response with the new
+    panelarr process tree so it can swap this container after the HTTP
+    response has been sent (rolling back if the new one fails to start).
+
+    If the container's image tag is a version (e.g. ``:0.3.0``), it is moved to
+    ``body.version`` or, when omitted, to the newest release reported by
+    ``/version-check``. ``latest``/``dev`` tags are simply re-pulled. The
+    frontend should poll ``GET /api/healthz`` until it answers with the new
     version, then reload.
     """
     from backend.services.docker import self_update
 
-    return await self_update()
+    target = body.version if body else None
+    if target is not None and _parse_semver(target.lstrip("v")) < _parse_semver(
+        pkg_version("panelarr")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Refusing to downgrade; pull an older image manually if you really need one",
+        )
+    if target is None:
+        check = await version_check()
+        if check.get("update_available"):
+            target = check.get("latest")
+    return await self_update(target_version=target)

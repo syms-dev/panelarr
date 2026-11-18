@@ -30,7 +30,16 @@ import {
 } from "@/components/ui/table";
 import { useContainerAction, useContainerUpdates, useContainers, usePullContainer } from "@/hooks/use-api";
 import { useWebSocket } from "@/hooks/use-websocket";
-import { cn } from "@/lib/utils";
+import { cn, safeHref } from "@/lib/utils";
+
+const STREAM_STATUS_LABELS = {
+  connecting: "Connecting",
+  reconnecting: "Reconnecting",
+  session_expired: "Session expired",
+  forbidden: "Forbidden (bad origin)",
+  bad_request: "Invalid container",
+  stopped: "Container stopped",
+};
 
 function ContainerLogs({ containerName, containerState }) {
   const [lines, setLines] = useState([]);
@@ -53,7 +62,7 @@ function ContainerLogs({ containerName, containerState }) {
     [isPaused],
   );
 
-  const { isConnected } = useWebSocket(
+  const { isConnected, status } = useWebSocket(
     containerName ? `/ws/logs/${containerName}` : null,
     { onMessage, enabled: !!containerName },
   );
@@ -66,8 +75,13 @@ function ContainerLogs({ containerName, containerState }) {
     <div className="flex flex-col gap-2">
       <div className="flex items-center gap-2 flex-wrap">
         <Badge variant={isConnected ? "success" : "secondary"}>
-          {isConnected ? "Live" : "Disconnected"}
+          {isConnected ? "Live" : STREAM_STATUS_LABELS[status] ?? "Disconnected"}
         </Badge>
+        {status === "session_expired" && (
+          <a href="/login?next=/containers" className="text-xs text-primary underline">
+            Sign in again
+          </a>
+        )}
         <Button
           variant="outline"
           size="sm"
@@ -113,7 +127,7 @@ function ContainerLogs({ containerName, containerState }) {
 }
 
 function cleanImageName(image) {
-  if (!image) return ", ";
+  if (!image) return "—";
   // Remove sha256 prefix
   if (image.startsWith("sha256:")) return image.slice(0, 19) + "...";
   // Remove registry prefix for cleaner display
@@ -298,9 +312,9 @@ export default function Containers() {
                         <ArrowUpCircleIcon className="size-3.5" />
                       </span>
                     )}
-                    {c.urls?.length > 0 && (
+                    {safeHref(c.urls?.[0]?.url) && (
                       <a
-                        href={c.urls[0].url}
+                        href={safeHref(c.urls[0].url)}
                         target="_blank"
                         rel="noopener noreferrer"
                         onClick={(e) => e.stopPropagation()}
@@ -329,13 +343,13 @@ export default function Containers() {
                   {cleanImageName(c.image)}
                 </TableCell>
                 <TableCell className="hidden sm:table-cell text-muted-foreground">
-                  {c.uptime || ", "}
+                  {c.uptime || "—"}
                 </TableCell>
                 <TableCell className="hidden lg:table-cell tabular-nums">
-                  {c.state === "running" ? `${c.cpu_percent}%` : ", "}
+                  {c.state === "running" ? `${c.cpu_percent}%` : "—"}
                 </TableCell>
                 <TableCell className="hidden lg:table-cell text-muted-foreground">
-                  {c.state === "running" ? c.memory_usage : ", "}
+                  {c.state === "running" ? c.memory_usage : "—"}
                 </TableCell>
               </TableRow>
             ))}
@@ -369,12 +383,12 @@ export default function Containers() {
               </div>
               <div>
                 <p className="text-xs text-muted-foreground">Uptime</p>
-                <p className="text-sm">{selectedContainer?.uptime || ", "}</p>
+                <p className="text-sm">{selectedContainer?.uptime || "—"}</p>
               </div>
               <div>
                 <p className="text-xs text-muted-foreground">CPU</p>
                 <p className="text-sm tabular-nums">
-                  {selectedContainer?.state === "running" ? `${selectedContainer.cpu_percent}%` : ", "}
+                  {selectedContainer?.state === "running" ? `${selectedContainer.cpu_percent}%` : "—"}
                 </p>
               </div>
               <div>
@@ -382,7 +396,7 @@ export default function Containers() {
                 <p className="text-sm">
                   {selectedContainer?.state === "running"
                     ? `${selectedContainer.memory_usage} / ${selectedContainer.memory_limit}`
-                    : ", "}
+                    : "—"}
                 </p>
               </div>
               <div>
@@ -399,19 +413,26 @@ export default function Containers() {
               <div>
                 <p className="text-xs text-muted-foreground mb-1">Public URLs</p>
                 <div className="flex flex-col gap-1">
-                  {selectedContainer.urls.map((u) => (
-                    <a
-                      key={u.url}
-                      href={u.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 text-sm text-primary hover:underline"
-                    >
-                      <ExternalLinkIcon className="size-3" />
-                      {u.url}
-                      <span className="text-xs text-muted-foreground">({u.source})</span>
-                    </a>
-                  ))}
+                  {selectedContainer.urls.map((u) =>
+                    safeHref(u.url) ? (
+                      <a
+                        key={u.url}
+                        href={safeHref(u.url)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-sm text-primary hover:underline"
+                      >
+                        <ExternalLinkIcon className="size-3" />
+                        {u.url}
+                        <span className="text-xs text-muted-foreground">({u.source})</span>
+                      </a>
+                    ) : (
+                      <span key={u.url} className="break-all text-sm text-muted-foreground">
+                        {u.url}
+                        <span className="text-xs"> ({u.source})</span>
+                      </span>
+                    ),
+                  )}
                 </div>
               </div>
             )}

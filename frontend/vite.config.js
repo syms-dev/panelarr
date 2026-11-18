@@ -4,6 +4,16 @@ import react from "@vitejs/plugin-react";
 import path from "path";
 import { defineConfig } from "vite";
 
+/**
+ * The backend rejects state-changing requests carrying a foreign Origin. The
+ * dev server forwards the browser's Origin (localhost:5173) to :8000, so strip
+ * it on the proxied request (HTTP and WebSocket upgrade).
+ */
+function stripOrigin(proxy) {
+  proxy.on("proxyReq", (proxyReq) => proxyReq.removeHeader("origin"));
+  proxy.on("proxyReqWs", (proxyReq) => proxyReq.removeHeader("origin"));
+}
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
@@ -16,11 +26,13 @@ export default defineConfig({
       "/api": {
         target: "http://localhost:8000",
         changeOrigin: true,
+        configure: stripOrigin,
       },
       "/ws": {
         target: "http://localhost:8000",
         changeOrigin: true,
         ws: true,
+        configure: stripOrigin,
       },
     },
   },

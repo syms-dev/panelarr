@@ -54,11 +54,9 @@ export default function MovieDetail() {
     return (
       <div className="flex min-h-[50vh] flex-col items-center justify-center gap-4">
         <p className="text-muted-foreground">Movie not found</p>
-        <Button variant="outline" asChild>
-          <Link to="/movies">
-            <ArrowLeftIcon className="mr-2 size-4" />
-            Back to Movies
-          </Link>
+        <Button variant="outline" render={<Link to="/movies" />}>
+          <ArrowLeftIcon className="mr-2 size-4" />
+          Back to Movies
         </Button>
       </div>
     );
@@ -226,7 +224,7 @@ export default function MovieDetail() {
         <StatCard
           icon={FilmIcon}
           label="Runtime"
-          value={movie.runtime > 0 ? `${movie.runtime} min` : ", "}
+          value={movie.runtime > 0 ? `${movie.runtime} min` : "—"}
         />
       </div>
 
@@ -271,36 +269,48 @@ export default function MovieDetail() {
       {/* External links */}
       <div className="flex flex-wrap gap-2">
         {movie.imdbId && (
-          <Button variant="outline" size="sm" asChild>
-            <a
-              href={`https://www.imdb.com/title/${movie.imdbId}`}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              IMDb
-            </a>
+          <Button
+            variant="outline"
+            size="sm"
+            render={
+              <a
+                href={`https://www.imdb.com/title/${encodeURIComponent(movie.imdbId)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+              />
+            }
+          >
+            IMDb
           </Button>
         )}
         {movie.tmdbId && (
-          <Button variant="outline" size="sm" asChild>
-            <a
-              href={`https://www.themoviedb.org/movie/${movie.tmdbId}`}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              TMDB
-            </a>
+          <Button
+            variant="outline"
+            size="sm"
+            render={
+              <a
+                href={`https://www.themoviedb.org/movie/${encodeURIComponent(movie.tmdbId)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+              />
+            }
+          >
+            TMDB
           </Button>
         )}
         {movie.youTubeTrailerId && (
-          <Button variant="outline" size="sm" asChild>
-            <a
-              href={`https://www.youtube.com/watch?v=${movie.youTubeTrailerId}`}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Trailer
-            </a>
+          <Button
+            variant="outline"
+            size="sm"
+            render={
+              <a
+                href={`https://www.youtube.com/watch?v=${encodeURIComponent(movie.youTubeTrailerId)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+              />
+            }
+          >
+            Trailer
           </Button>
         )}
       </div>
@@ -334,7 +344,7 @@ function InfoRow({ label, value, className }) {
   return (
     <div className={className}>
       <span className="text-muted-foreground">{label}: </span>
-      <span className="font-medium break-all">{value || ", "}</span>
+      <span className="font-medium break-all">{value || "—"}</span>
     </div>
   );
 }

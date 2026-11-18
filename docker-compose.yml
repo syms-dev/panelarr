@@ -1,6 +1,6 @@
 services:
   panelarr:
-    image: ghcr.io/thug-drama/panelarr:latest
+    image: ghcr.io/syms-dev/panelarr:latest
     build: .
     container_name: panelarr
     restart: unless-stopped
@@ -10,6 +10,8 @@ services:
       - CHOWN
       - SETUID
       - SETGID
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     deploy:
@@ -21,8 +23,11 @@ services:
       - "8000:8000"  # remove when fronting with Traefik or another reverse proxy
     volumes:
       # Docker socket, required so Panelarr can manage your containers.
+      # Note: ":ro" only stops the socket *file* being replaced; it does not
+      # limit the Docker API. Anything that can talk to this socket controls
+      # the host, so keep authentication on (Settings → Authentication).
       # For tighter control, use a socket proxy like tecnativa/docker-socket-proxy
-      # instead of mounting the raw daemon socket.
+      # instead of mounting the raw daemon socket (set DOCKER_SOCKET=tcp://...).
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Persistent config (panelarr.json lives here)
       - panelarr_config:/config
@@ -33,7 +38,7 @@ services:
         - "CMD"
         - "python"
         - "-c"
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/system/health')"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/healthz')"
       interval: 30s
       timeout: 10s
       retries: 3
