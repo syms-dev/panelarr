@@ -121,7 +121,11 @@ and from a verified security sweep of the fixed branch (`docs/audits/2026-11-17-
 ### Fixed
 
 - qBittorrent 5.x: login (204 response), stop/start actions, stopped states;
-  paused torrents stay listed with Resume.
+  paused torrents stay listed with Resume. Thanks to @rolki-png for reporting
+  and testing the 5.x login against a real instance (#2).
+- Disk Usage no longer lists Docker **file** bind-mounts (e.g. a mounted
+  entrypoint script); only directory mountpoints are treated as disks (#3,
+  thanks @rolki-png).
 - API-key mode no longer locks the browser out (sign in once with the key);
   basic auth chosen in the wizard no longer bounces to `/login` mid-wizard;
   "Re-run setup wizard" works; the thresholds step keeps the disk selection.
@@ -148,10 +152,6 @@ and from a verified security sweep of the fixed branch (`docs/audits/2026-11-17-
   Playwright e2e suite (`frontend/e2e`, CI job `E2E`).
 
 ## [0.1.0-alpha] - Unreleased
-
-### Fixed
-
-- Disk Usage no longer lists Docker **file** bind-mounts (e.g. a mounted entrypoint script). Only directory mountpoints are treated as disks.
 
 ### Removed
 
