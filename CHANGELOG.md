@@ -17,11 +17,14 @@ Panelarr uses [Semantic Versioning](https://semver.org):
 
 | Version | Status | Scope |
 |---|---|---|
-| `0.4.0-alpha` | current | dashboard, containers, downloads, calendar, shows, movies, settings, notifications, log streaming, setup wizard, ruff + pytest + vitest CI, GHCR publishing |
-| `1.0.0-beta` | planned | feature complete, ready for community testing. Watch history from Plex and Jellyfin, polished onboarding, stable REST API surface |
-| `1.0.0` | planned | stable release, API freeze |
+| `0.4.0-alpha` | current | dashboard, containers, downloads, calendar, shows, movies, settings, notifications, log streaming, setup wizard; security release |
+| `0.5.0-alpha` | planned | Transmission, Deluge and NZBGet on the downloads page, verified Saltbox guide, trusted proxies by container name, remaining audit items, CI against real Docker |
+| `0.6.0-alpha` | planned | watch history from Plex, Jellyfin and Emby |
+| `0.7.0-alpha` | planned | versioned config with tested migrations, upgrade test from the previous release, release-based update check |
+| `1.0.0-beta` | planned | feature freeze, versioned REST API (`/api/v1`) with a deprecation policy, onboarding polish, full security review |
+| `1.0.0` | planned | stable release, API freeze, after a public beta with no open critical or security bugs |
 
-Minor alpha bumps (`0.2.0-alpha`, `0.3.0-alpha`, etc.) happen on meaningful milestones between now and beta.
+Each version is a [GitHub milestone](https://github.com/syms-dev/panelarr/milestones) with its issues.
 
 ## [Unreleased]
 

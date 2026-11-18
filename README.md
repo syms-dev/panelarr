@@ -182,7 +182,13 @@ Backend at `http://localhost:8000` (OpenAPI docs at `/docs`). Frontend at `http:
 
 ## Roadmap
 
-- Watch history from Plex and Jellyfin
+Tracked as [milestones](https://github.com/syms-dev/panelarr/milestones) on GitHub:
+
+- **0.5.0-alpha**: everything listed under Supported Services works on the downloads page (Transmission, Deluge, NZBGet), a verified Saltbox guide, proxy mode that survives a recreated Traefik, the remaining audit items, and CI against a real Docker daemon.
+- **0.6.0-alpha**: watch history from Plex, Jellyfin and Emby.
+- **0.7.0-alpha**: upgrade safety: a versioned config with tested migrations, an upgrade test from the previous release, and an update check based on GitHub releases.
+- **1.0.0-beta**: feature freeze, a versioned REST API (`/api/v1`) with a deprecation policy, onboarding polish, and a full security review.
+- **1.0.0**: stable, after a public beta with no open critical or security bugs.
 
 ## License
 
