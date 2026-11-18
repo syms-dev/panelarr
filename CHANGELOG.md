@@ -28,6 +28,15 @@ Each version is a [GitHub milestone](https://github.com/syms-dev/panelarr/milest
 
 ## [Unreleased]
 
+### Fixed
+
+- **The container turns healthy when `PANELARR_ALLOWED_HOSTS` is set.** The
+  image's healthcheck calls `localhost:8000/api/healthz`, which the host
+  allowlist refused (421), so the container stayed unhealthy: Traefik then
+  doesn't route to it, and autoheal restarts it. `/api/healthz` (GET and HEAD
+  only) now answers before the Host check. Workaround on 0.4.0-alpha: add
+  `localhost` to `PANELARR_ALLOWED_HOSTS`.
+
 ## [0.4.0-alpha] - 2026-11-18
 
 A security release. A full audit of 0.3.1-alpha (unit, e2e and live
