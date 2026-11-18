@@ -11,7 +11,7 @@ Trigger: owner request for a full sweep after the 2026-11-16 audit fixes; the zo
 by design (`docs/audits/categories.md`); findings here are guards the code claims and outbound
 requests the docs say are refused.
 
-Commit: 488433a5e623382ee2d7e56d44256c20220cab17
+Commit: af8e46af79661e8669cd5d9547a584a51b2c943e
 
 ## Delegation
 
