@@ -37,7 +37,16 @@ def _write_services(config_path: Path, *, sonarr: bool = False, radarr: bool = F
         services["sonarr"] = {"url": "http://sonarr:8989", "api_key": "skey"}
     if radarr:
         services["radarr"] = {"url": "http://radarr:7878", "api_key": "rkey"}
-    config_path.write_text(json.dumps({"services": services}))
+    # Auth mode "none" with setup done, so the router tests reach the handler.
+    config_path.write_text(
+        json.dumps(
+            {
+                "services": services,
+                "auth": {"mode": "none"},
+                "setup": {"completed_at": "test"},
+            }
+        )
+    )
 
     import backend.services.config as svc_cfg
 

@@ -56,6 +56,8 @@ export function AuthSection({
   onGenerateApiKey,
   isGeneratingApiKey = false,
   showCurrentBadge = false,
+  error = "",
+  showTrustedProxies = false,
 }) {
   const [hasCopied, setHasCopied] = useState(false);
 
@@ -227,7 +229,32 @@ export function AuthSection({
             Authelia: Remote-User · Authentik: X-authentik-username · oauth2-proxy:
             X-Auth-Request-User
           </p>
+          {showTrustedProxies && (
+            <div className="mt-4">
+              <Label htmlFor="trusted-proxies" className="mb-1">
+                Trusted proxies (one CIDR per line)
+              </Label>
+              <textarea
+                id="trusted-proxies"
+                rows={4}
+                value={value.trustedProxiesText ?? ""}
+                onChange={(e) => handleField("trustedProxiesText", e.target.value)}
+                placeholder={"172.16.0.0/12\n10.0.0.5/32"}
+                spellCheck={false}
+                className="w-full rounded-lg border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Only requests from these addresses may set the auth header. Defaults to localhost; switching to proxy mode through your proxy adds its address automatically.
+              </p>
+            </div>
+          )}
         </div>
+      )}
+
+      {error && !isReadOnly && (
+        <Alert variant="error" role="alert">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
       )}
 
       {/* API key generation */}
@@ -259,7 +286,7 @@ export function AuthSection({
               <Alert variant="warning">
                 <AlertTitle>Copy your API key now</AlertTitle>
                 <AlertDescription>
-                  This key will not be shown again. Store it securely.
+                  Store it now: this key will not be shown again.
                 </AlertDescription>
               </Alert>
               <div className="flex items-center gap-2">
