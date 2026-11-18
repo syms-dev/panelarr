@@ -41,7 +41,7 @@ import {
   useSeasonSearch,
   useEpisodeSearch,
 } from "@/hooks/use-api";
-import { cn, formatDate, formatSize } from "@/lib/utils";
+import { cn, formatDate, formatSize, parseDate } from "@/lib/utils";
 
 const STATUS_CONFIG = {
   continuing: { label: "Continuing", variant: "success" },
@@ -54,13 +54,18 @@ const STATUS_CONFIG = {
 // want to nag users about an episode that aired an hour ago.
 const MISSING_GRACE_HOURS = 24;
 
+/** Air instant: airDateUtc when present, else the local-parsed date-only airDate. */
+function episodeAirDate(ep) {
+  return parseDate(ep.airDateUtc) ?? parseDate(ep.airDate);
+}
+
 function isAired(ep) {
-  const airDate = ep.airDate ? new Date(ep.airDate) : null;
+  const airDate = episodeAirDate(ep);
   return Boolean(airDate && airDate <= new Date());
 }
 
 function isWithinGrace(ep) {
-  const airDate = ep.airDate ? new Date(ep.airDate) : null;
+  const airDate = episodeAirDate(ep);
   if (!airDate) return false;
   const cutoff = new Date(airDate.getTime() + MISSING_GRACE_HOURS * 3600 * 1000);
   return airDate <= new Date() && new Date() < cutoff;
@@ -252,10 +257,10 @@ function SeasonSection({ season, showId, downloadsByEpId }) {
                       <EpisodeStatusIcon episode={ep} download={download} />
                     </TableCell>
                     <TableCell className="hidden md:table-cell text-muted-foreground">
-                      {ep.quality || ", "}
+                      {ep.quality || "—"}
                     </TableCell>
                     <TableCell className="hidden md:table-cell text-right text-muted-foreground tabular-nums">
-                      {ep.size ? formatSize(ep.size) : ", "}
+                      {ep.size ? formatSize(ep.size) : "—"}
                     </TableCell>
                     <TableCell>
                       {missing && !download && (
@@ -320,11 +325,9 @@ export default function ShowDetail() {
     return (
       <div className="flex min-h-[50vh] flex-col items-center justify-center gap-4">
         <p className="text-muted-foreground">Show not found</p>
-        <Button variant="outline" asChild>
-          <Link to="/shows">
-            <ArrowLeftIcon className="mr-2 size-4" />
-            Back to Shows
-          </Link>
+        <Button variant="outline" render={<Link to="/shows" />}>
+          <ArrowLeftIcon className="mr-2 size-4" />
+          Back to Shows
         </Button>
       </div>
     );

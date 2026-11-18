@@ -52,12 +52,15 @@ def test_auth_mode_default(config_path: Path) -> None:
     assert get_effective_auth_mode() == "none"
 
 
-def test_auth_mode_invalid_falls_back_to_none(config_path: Path) -> None:
+def test_auth_mode_invalid_fails_closed(config_path: Path) -> None:
+    # An unknown mode must never mean "no auth" (2026-11-17-auth-sessions/F7).
     config_path.write_text(json.dumps({"auth": {"mode": "nonsense"}}))
 
     from backend.services.auth_config import get_effective_auth_mode
+    from backend.services.config import ConfigError
 
-    assert get_effective_auth_mode() == "none"
+    with pytest.raises(ConfigError):
+        get_effective_auth_mode()
 
 
 def test_credentials_from_config(config_path: Path) -> None:
@@ -97,11 +100,26 @@ def test_set_auth_writes_bcrypt_hash(config_path: Path) -> None:
     assert verify_password("hunter2", auth["password_hash"])
 
 
-def test_set_auth_preserves_secret(config_path: Path) -> None:
-    # Pre-populate with an existing secret
+def test_set_auth_preserves_secret_without_credential_change(config_path: Path) -> None:
+    config_path.write_text(json.dumps({"auth": {"secret": "existingsecret", "username": "bob"}}))
+
+    import backend.services.config as svc_cfg
+
+    svc_cfg._config_cache = None
+
+    from backend.services.auth_config import set_auth_in_config
+
+    set_auth_in_config(mode="basic", proxy_header="X-User")
+
+    data = json.loads(config_path.read_text())
+    assert data["auth"]["secret"] == "existingsecret"
+    assert data["auth"]["username"] == "bob"
+
+
+def test_set_auth_rotates_secret_on_password_change(config_path: Path) -> None:
+    """A new password must invalidate every existing session."""
     config_path.write_text(json.dumps({"auth": {"secret": "existingsecret"}}))
 
-    # Bust the cache so we read from the new file
     import backend.services.config as svc_cfg
 
     svc_cfg._config_cache = None
@@ -111,7 +129,7 @@ def test_set_auth_preserves_secret(config_path: Path) -> None:
     set_auth_in_config(mode="basic", username="bob", password="pass")
 
     data = json.loads(config_path.read_text())
-    assert data["auth"]["secret"] == "existingsecret"
+    assert data["auth"]["secret"] not in ("", "existingsecret")
     assert data["auth"]["username"] == "bob"
 
 
@@ -157,8 +175,11 @@ def test_setup_backfill_with_services(config_path: Path) -> None:
 
     svc_cfg._config_cache = None
 
-    from backend.services.auth_config import is_setup_complete
+    from backend.services.auth_config import backfill_legacy_setup, is_setup_complete
 
+    # Reading never migrates; only the startup backfill does.
+    assert is_setup_complete() is False
+    assert backfill_legacy_setup() is True
     assert is_setup_complete() is True
 
     # Verify the flag was written

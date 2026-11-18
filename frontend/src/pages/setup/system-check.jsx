@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { DiskSelector } from "@/components/disk-selector";
 import { useSetupDisks, useSetupSystemCheck } from "@/hooks/use-api";
+import { toastManager } from "@/components/ui/toast";
 import { useSetupActions, useSetupNav, useSetupState } from "@/hooks/use-setup";
 
 function CheckRow({ check }) {
@@ -43,8 +44,8 @@ export default function SetupSystemCheck() {
   const { data, isLoading, isFetching } = useSetupSystemCheck();
   const qc = useQueryClient();
   const { goBack, goNext } = useSetupNav("/setup/system-check");
-  const { selectedDisks } = useSetupState();
-  const { setSelectedDisks, toggleDisk } = useSetupActions();
+  const { selectedDisks, disksSeeded } = useSetupState();
+  const { setSelectedDisks, toggleDisk, markDisksSeeded } = useSetupActions();
   const saveDisks = useSetupDisks();
   const [isSaving, setIsSaving] = useState(false);
 
@@ -54,26 +55,38 @@ export default function SetupSystemCheck() {
   const isDockerOk = dockerCheck?.ok ?? false;
   const allChecksRun = !isLoading && checks.length > 0;
 
-  // Seed disk selection on first load: prefer server-saved selection,
-  // otherwise default to all detected disks.
+  // Seed disk selection ONCE: prefer server-saved selection, otherwise all
+  // detected disks. After that the user owns the selection, so deselecting
+  // every disk does not silently re-seed.
   useEffect(() => {
-    if (!data) return;
-    if (selectedDisks.length > 0) return;
-    const initial = data.selected_disks?.length
-      ? data.selected_disks
-      : (data.disks ?? []).map((d) => d.mount);
-    if (initial.length > 0) setSelectedDisks(initial);
-  }, [data, selectedDisks.length, setSelectedDisks]);
+    if (!data || disksSeeded) return;
+    if (selectedDisks.length === 0) {
+      const initial = data.selected_disks?.length
+        ? data.selected_disks
+        : (data.disks ?? []).map((d) => d.mount);
+      if (initial.length > 0) setSelectedDisks(initial);
+    }
+    markDisksSeeded();
+  }, [data, disksSeeded, selectedDisks.length, setSelectedDisks, markDisksSeeded]);
+
+  const hasNoDiskSelected = disks.length > 0 && selectedDisks.length === 0;
 
   function handleRerun() {
     qc.invalidateQueries({ queryKey: ["setup-system-check"] });
   }
 
   async function handleNext() {
+    if (hasNoDiskSelected) return;
     setIsSaving(true);
     try {
       await saveDisks.mutateAsync({ mounts: selectedDisks });
       goNext();
+    } catch (err) {
+      toastManager.add({
+        type: "error",
+        title: "Failed to save disk selection",
+        description: err.message,
+      });
     } finally {
       setIsSaving(false);
     }
@@ -102,6 +115,13 @@ export default function SetupSystemCheck() {
         </div>
       )}
 
+      {allChecksRun && !isDockerOk && (
+        <p role="status" className="text-xs text-muted-foreground">
+          Docker is not reachable, so container features stay unavailable until
+          it is fixed. You can continue and fix this later.
+        </p>
+      )}
+
       {disks.length > 0 && (
         <div className="space-y-3">
           <div>
@@ -115,6 +135,11 @@ export default function SetupSystemCheck() {
             selected={selectedDisks}
             onToggle={toggleDisk}
           />
+          {hasNoDiskSelected && (
+            <p role="alert" className="text-xs text-destructive">
+              Select at least one disk to monitor.
+            </p>
+          )}
         </div>
       )}
 
@@ -128,7 +153,7 @@ export default function SetupSystemCheck() {
             Re-run
           </Button>
         </div>
-        <Button onClick={handleNext} disabled={!isDockerOk || isLoading || isSaving}>
+        <Button onClick={handleNext} disabled={isLoading || isSaving || hasNoDiskSelected}>
           {isSaving ? <Spinner className="size-4" /> : null}
           Next
         </Button>

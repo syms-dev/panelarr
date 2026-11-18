@@ -19,5 +19,8 @@ fi
 # was created (root-owned named volume, bind mount, etc.)
 chown -R panelarr:panelarr /config 2>/dev/null || true
 
-# Drop to non-root and start the app
-exec gosu panelarr uvicorn backend.main:app --host 0.0.0.0 --port "${PANELARR_PORT:-8000}"
+# Drop to non-root and start the app. --no-proxy-headers: Panelarr reads
+# X-Forwarded-* itself, only from its trusted proxies (backend/services/security.py);
+# uvicorn's own handling would rewrite the client address before that check.
+exec gosu panelarr uvicorn backend.main:app --host "${PANELARR_HOST:-0.0.0.0}" \
+    --port "${PANELARR_PORT:-8000}" --no-proxy-headers
