@@ -35,6 +35,10 @@ control of Docker, and through it the host. All of them are fixed here.
 
 ### Upgrade notes
 
+- **The image moved to `ghcr.io/syms-dev/panelarr`** (the GitHub account was
+  renamed; the old `ghcr.io/thug-drama/panelarr` no longer resolves). Change
+  the `image:` line in your compose file by hand once. 0.3.1-alpha and earlier
+  can't see or self-update to this release, because they look for the old name.
 - **Proxy auth mode:** after upgrading, open Panelarr through your reverse
   proxy and save proxy mode again in Settings (or set
   `PANELARR_TRUSTED_PROXIES`). Until then, requests are refused with 401.

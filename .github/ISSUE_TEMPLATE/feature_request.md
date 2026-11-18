@@ -3,7 +3,7 @@ name: Feature request
 about: Suggest a new feature or improvement for Panelarr
 title: "[feature] "
 labels: enhancement
-assignees: thug-drama
+assignees: syms-dev
 ---
 
 ## What problem does this solve?

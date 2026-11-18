@@ -7,8 +7,8 @@
 <br />
 <br />
 
-[![CI](https://github.com/thug-drama/panelarr/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/thug-drama/panelarr/actions/workflows/ci.yml)
-![Version](https://img.shields.io/github/v/release/thug-drama/panelarr?include_prereleases&style=flat-square&color=6366f1&label=version)
+[![CI](https://github.com/syms-dev/panelarr/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/syms-dev/panelarr/actions/workflows/ci.yml)
+![Version](https://img.shields.io/github/v/release/syms-dev/panelarr?include_prereleases&style=flat-square&color=6366f1&label=version)
 ![License](https://img.shields.io/badge/license-MIT-6366f1?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.11+-3776ab?style=flat-square&logo=python&logoColor=white)
 ![React](https://img.shields.io/badge/React-18-61dafb?style=flat-square&logo=react&logoColor=black)
@@ -62,7 +62,7 @@ Create a `docker-compose.yml`:
 ```yaml
 services:
   panelarr:
-    image: ghcr.io/thug-drama/panelarr:latest
+    image: ghcr.io/syms-dev/panelarr:latest
     container_name: panelarr
     ports:
       - "8000:8000"
@@ -96,7 +96,7 @@ Traefik users: see [docs/configuration.md](docs/configuration.md) for network an
 ### Option 2. Build from source
 
 ```bash
-git clone https://github.com/thug-drama/panelarr.git
+git clone https://github.com/syms-dev/panelarr.git
 cd panelarr
 docker compose up -d --build
 ```
@@ -166,7 +166,7 @@ Full reference in [docs/configuration.md](docs/configuration.md): JSON schema, T
 Active work lands on `develop`; `main` is cut from `develop` at release time by the maintainer and holds tagged stable releases only. Pull requests should target `develop`, never `main`. See [CONTRIBUTING.md](CONTRIBUTING.md) for full setup, code style, branch naming, and PR process.
 
 ```bash
-git clone https://github.com/thug-drama/panelarr.git
+git clone https://github.com/syms-dev/panelarr.git
 cd panelarr
 pip install -e ".[dev]"
 npm -C frontend install

@@ -3,7 +3,7 @@ name: Bug report
 about: Something in Panelarr is broken or behaving unexpectedly
 title: "[bug] "
 labels: bug
-assignees: thug-drama
+assignees: syms-dev
 ---
 
 ## Describe the bug

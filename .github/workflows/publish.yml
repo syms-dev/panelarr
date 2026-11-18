@@ -35,7 +35,8 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/thug-drama/panelarr
+          # The image follows the repository, so a renamed owner can't break publishing again.
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=branch,enable=${{ github.ref == 'refs/heads/develop' }},suffix=
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/develop' }}

@@ -420,7 +420,7 @@ _cached_latest: dict | None = None
 _cached_latest_at: float = 0.0
 _VERSION_CHECK_TTL = 3600  # cache for 1 hour
 
-GHCR_IMAGE = "thug-drama/panelarr"
+GHCR_IMAGE = "syms-dev/panelarr"
 
 
 def _parse_semver(v: str) -> tuple[int, ...]:
