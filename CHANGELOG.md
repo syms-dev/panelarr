@@ -17,7 +17,7 @@ Panelarr uses [Semantic Versioning](https://semver.org):
 
 | Version | Status | Scope |
 |---|---|---|
-| `0.1.0-alpha` | current (unreleased) | dashboard, containers, downloads, calendar, shows, movies, settings, notifications, log streaming, setup wizard, ruff + pytest + vitest CI, GHCR publishing |
+| `0.4.0-alpha` | current | dashboard, containers, downloads, calendar, shows, movies, settings, notifications, log streaming, setup wizard, ruff + pytest + vitest CI, GHCR publishing |
 | `1.0.0-beta` | planned | feature complete, ready for community testing. Watch history from Plex and Jellyfin, polished onboarding, stable REST API surface |
 | `1.0.0` | planned | stable release, API freeze |
 
@@ -25,8 +25,29 @@ Minor alpha bumps (`0.2.0-alpha`, `0.3.0-alpha`, etc.) happen on meaningful mile
 
 ## [Unreleased]
 
-Fixes from a full audit (unit, e2e and live penetration testing) of 0.3.1-alpha,
-and from a verified security sweep of the fixed branch (`docs/audits/2026-11-17-*.md`).
+## [0.4.0-alpha] - 2026-11-18
+
+A security release. A full audit of 0.3.1-alpha (unit, e2e and live
+penetration testing), a verified security sweep and an independent bug hunt
+(`docs/audits/`) found several ways for anyone who could reach Panelarr to take
+control of Docker, and through it the host. All of them are fixed here.
+**Everyone on 0.3.1-alpha or earlier should upgrade.**
+
+### Upgrade notes
+
+- **Proxy auth mode:** after upgrading, open Panelarr through your reverse
+  proxy and save proxy mode again in Settings (or set
+  `PANELARR_TRUSTED_PROXIES`). Until then, requests are refused with 401.
+- **First-run setup through a hostname** (rather than an IP address or
+  `localhost`) needs that hostname in `PANELARR_ALLOWED_HOSTS`; otherwise the
+  setup API answers 421.
+- **Cross-origin writes are refused (403).** If your proxy rewrites `Host`,
+  set `PANELARR_ALLOWED_ORIGINS`.
+- **A broken or unknown auth config fails closed:** an unparseable
+  `panelarr.json`, an unknown `auth.mode`, or an unreadable `/config` now
+  answers 503 `config_invalid` instead of running without authentication.
+- The API docs moved to `/api/docs` (behind auth). Container healthchecks
+  should use the new public `/api/healthz`.
 
 ### Security
 
