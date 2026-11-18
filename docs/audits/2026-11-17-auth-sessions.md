@@ -16,7 +16,7 @@ Previous review: the 2026-11-16 audit (items 1 to 33 against develop @ 43c8e79, 
 repository) and a follow-up review that closed M1, M2, M3, L1, L2, L4 and L5. None is re-reported
 here; F2 and F4 are bypasses of the M3 fix (no Docker gateway trusted by default).
 
-Commit: af8e46af79661e8669cd5d9547a584a51b2c943e
+Commit: 2c08b9ca107c889e896874630396ea8bd91988cd
 
 ## Delegation
 

@@ -10,7 +10,7 @@ Trigger: owner request for a full sweep. First run of this zone. The uvicorn lau
 `entrypoint.sh` was swept for authentication effects in the auth-sessions zone (F2, F3 there) and is
 not re-reported here.
 
-Commit: af8e46af79661e8669cd5d9547a584a51b2c943e
+Commit: 2c08b9ca107c889e896874630396ea8bd91988cd
 
 ## Delegation
 

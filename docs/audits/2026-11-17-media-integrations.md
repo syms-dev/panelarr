@@ -9,7 +9,7 @@ Scope: `backend/services/arr.py`, `backend/routers/arr.py`, `backend/routers/dow
 Trigger: owner request for a full sweep after the 2026-11-16 audit fixes (qBittorrent 5.x, the ICS
 feed token, poster proxying, calendar dates). Fresh code; first run of this zone.
 
-Commit: af8e46af79661e8669cd5d9547a584a51b2c943e
+Commit: 2c08b9ca107c889e896874630396ea8bd91988cd
 
 ## Delegation
 

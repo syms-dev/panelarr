@@ -10,7 +10,7 @@ Trigger: owner request for a full sweep after the 2026-11-16 audit fixes (fail-c
 secret masking, the test-endpoint exfiltration fix M1, the resolving SSRF guard). Fresh code; first
 run of this zone.
 
-Commit: af8e46af79661e8669cd5d9547a584a51b2c943e
+Commit: 2c08b9ca107c889e896874630396ea8bd91988cd
 
 ## Delegation
 
