@@ -106,7 +106,8 @@ def _may_exist(path: Path) -> bool:
 
     ``Path.is_file()`` is not enough: from Python 3.14 it returns False when
     the directory cannot be searched (EACCES), which would make an existing,
-    unreadable panelarr.json look like a fresh install.
+    unreadable panelarr.json look like a fresh install; before 3.14 it raises
+    PermissionError instead. Use this, never ``is_file()``, on the config path.
     """
     try:
         path.stat()
@@ -304,15 +305,18 @@ def _preserve_secrets(merged: dict, original: dict, *, strict: bool = True) -> d
 
 def _migrate_config_file(config_path: Path) -> None:
     """Migrate old config file names to current name."""
-    if config_path.is_file():
+    if _may_exist(config_path):
         return
     old_names = ["stackpanel.json"]
     for old_name in old_names:
         old_path = config_path.parent / old_name
-        if old_path.is_file():
-            logger.info("Migrating config file: %s → %s", old_path, config_path)
-            old_path.rename(config_path)
-            return
+        try:
+            if old_path.is_file():
+                logger.info("Migrating config file: %s → %s", old_path, config_path)
+                old_path.rename(config_path)
+                return
+        except OSError as exc:
+            logger.warning("Could not migrate %s: %s", old_path, exc.strerror or exc)
 
 
 _config_cache: PanelarrConfig | None = None
@@ -386,7 +390,7 @@ def load_config() -> PanelarrConfig:
 
 def _backup_if_corrupt(config_path: Path) -> None:
     """Keep a copy of an unparseable config file before overwriting it."""
-    if not config_path.is_file():
+    if not _may_exist(config_path):
         return
     try:
         json.loads(config_path.read_text())
