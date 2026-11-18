@@ -89,6 +89,11 @@ def _collect_disks(filter_by_config: bool = True) -> list[dict]:
             continue
         if any(mp.startswith(p) for p in _SKIP_PREFIXES):
             continue
+        # Docker file bind-mounts appear as partitions; they are not disks.
+        # os.path.isdir, not Path.is_dir: before Python 3.14 the latter raises
+        # PermissionError on a mountpoint this user can't reach.
+        if not os.path.isdir(mp):
+            continue
         _try_add(mp)
 
     # Strip internal _dev field before returning
