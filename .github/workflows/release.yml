@@ -69,7 +69,7 @@ jobs:
             echo "::warning::COOLIFY_WEBHOOK or COOLIFY_TOKEN is not set, so panelarr.dev was not rebuilt."
             exit 0
           fi
-          if ! curl --fail-with-body -sS --max-time 60 \
+          if ! curl --fail-with-body -sS --max-time 60 -X POST \
               -H "Authorization: Bearer ${COOLIFY_TOKEN}" "${COOLIFY_WEBHOOK}"; then
             echo "::warning::The panelarr.dev rebuild request failed; redeploy the site in Coolify."
           fi
