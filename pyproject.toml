@@ -5,7 +5,7 @@ description = "Self-hosted control center for Docker-based media server stacks"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-authors = [{ name = "thug-drama" }]
+authors = [{ name = "syms-dev" }]
 dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.30,<1",
