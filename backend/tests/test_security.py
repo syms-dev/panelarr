@@ -575,6 +575,21 @@ async def test_allowed_hosts_blocks_dns_rebinding(config_path: Path, monkeypatch
         assert (await c.get("/api/config", headers={"Host": "rebind.evil"})).status_code == 421
 
 
+async def test_allowed_hosts_keep_container_healthcheck_working(
+    config_path: Path, monkeypatch
+) -> None:
+    """The image's HEALTHCHECK calls localhost:8000; an allowlist must not make it fail."""
+    _write(config_path, {"auth": {"mode": "basic"}, "setup": {"completed_at": "t"}})
+    monkeypatch.setenv("PANELARR_ALLOWED_HOSTS", "panelarr.example.com")
+    async with _client() as c:
+        resp = await c.get("/api/healthz", headers={"Host": "localhost:8000"})
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+        # Only the probe is exempt: every other route still checks the Host.
+        assert (await c.get("/api/config", headers={"Host": "localhost:8000"})).status_code == 421
+        assert (await c.post("/api/healthz", headers={"Host": "localhost:8000"})).status_code == 421
+
+
 async def test_self_update_refuses_downgrade(config_path: Path) -> None:
     _write(config_path, {"auth": {"mode": "none"}, "setup": {"completed_at": "t"}})
     async with _client() as c:

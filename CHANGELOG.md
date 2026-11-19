@@ -17,13 +17,38 @@ Panelarr uses [Semantic Versioning](https://semver.org):
 
 | Version | Status | Scope |
 |---|---|---|
-| `0.4.0-alpha` | current | dashboard, containers, downloads, calendar, shows, movies, settings, notifications, log streaming, setup wizard, ruff + pytest + vitest CI, GHCR publishing |
-| `1.0.0-beta` | planned | feature complete, ready for community testing. Watch history from Plex and Jellyfin, polished onboarding, stable REST API surface |
-| `1.0.0` | planned | stable release, API freeze |
+| `0.4.1-alpha` | current | dashboard, containers, downloads, calendar, shows, movies, settings, notifications, log streaming, setup wizard; security release (0.4.0), healthcheck fix and Saltbox guide (0.4.1) |
+| `0.5.0-alpha` | planned | Transmission, Deluge and NZBGet on the downloads page, verified Saltbox guide, trusted proxies by container name, remaining audit items, CI against real Docker |
+| `0.6.0-alpha` | planned | watch history from Plex, Jellyfin and Emby |
+| `0.7.0-alpha` | planned | versioned config with tested migrations, upgrade test from the previous release, release-based update check |
+| `1.0.0-beta` | planned | feature freeze, versioned REST API (`/api/v1`) with a deprecation policy, onboarding polish, full security review |
+| `1.0.0` | planned | stable release, API freeze, after a public beta with no open critical or security bugs |
 
-Minor alpha bumps (`0.2.0-alpha`, `0.3.0-alpha`, etc.) happen on meaningful milestones between now and beta.
+Each version is a [GitHub milestone](https://github.com/syms-dev/panelarr/milestones) with its issues.
 
 ## [Unreleased]
+
+## [0.4.1-alpha] - 2026-11-19
+
+A fix for anyone who set `PANELARR_ALLOWED_HOSTS`, as the 0.4.0-alpha upgrade
+notes recommend, plus a Saltbox guide checked on a real Saltbox server.
+
+### Added
+
+- **Saltbox guide** ([docs/saltbox.md](docs/saltbox.md)): the published image,
+  Saltbox's own Traefik labels, Authelia, a calendar feed route without
+  Authelia, the app addresses for setup, running next to saltbox-ui, and how
+  to get back in when Traefik's address changes. It replaces the two Saltbox
+  examples in `docs/configuration.md` (#10).
+
+### Fixed
+
+- **The container turns healthy when `PANELARR_ALLOWED_HOSTS` is set.** The
+  image's healthcheck calls `localhost:8000/api/healthz`, which the host
+  allowlist refused (421), so the container stayed unhealthy: Traefik then
+  doesn't route to it, and autoheal restarts it. `/api/healthz` (GET and HEAD
+  only) now answers before the Host check. Workaround on 0.4.0-alpha: add
+  `localhost` to `PANELARR_ALLOWED_HOSTS`.
 
 ## [0.4.0-alpha] - 2026-11-18
 

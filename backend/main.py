@@ -130,6 +130,12 @@ async def auth_middleware(request: Request, call_next):
         # SPA shell and static assets; the frontend handles redirects.
         return await call_next(request)
 
+    # Before the Host check: the image's HEALTHCHECK calls localhost:8000, and
+    # with PANELARR_ALLOWED_HOSTS set the container would never turn healthy
+    # (Traefik then won't route to it). The answer is a constant.
+    if path == "/api/healthz" and request.method in ("GET", "HEAD"):
+        return await call_next(request)
+
     if not host_allowed(request):
         return JSONResponse(status_code=421, content={"detail": "Unknown host"})
 
