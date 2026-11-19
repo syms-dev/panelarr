@@ -105,8 +105,10 @@ When running behind Traefik:
 ```yaml
 services:
   panelarr:
-    build: .
+    image: ghcr.io/syms-dev/panelarr:latest
     container_name: panelarr
+    environment:
+      - PANELARR_ALLOWED_HOSTS=panelarr.your-domain.com
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /opt/panelarr/config:/config
@@ -125,34 +127,11 @@ networks:
     external: true
 ```
 
-Replace `traefik` with your Traefik network name.
+Replace `traefik` with your Traefik network name. `PANELARR_ALLOWED_HOSTS` lets you run the setup wizard through the domain.
 
 ### Saltbox
 
-Saltbox runs Traefik on a network called `saltbox`:
-
-```yaml
-services:
-  panelarr:
-    build: .
-    container_name: panelarr
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /opt/panelarr/config:/config
-    restart: unless-stopped
-    networks:
-      - saltbox
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.panelarr.rule=Host(`panelarr.your-domain.com`)"
-      - "traefik.http.routers.panelarr.entrypoints=websecure"
-      - "traefik.http.routers.panelarr.tls.certresolver=letsencrypt"
-      - "traefik.http.services.panelarr.loadbalancer.server.port=8000"
-
-networks:
-  saltbox:
-    external: true
-```
+See [saltbox.md](saltbox.md) for a verified setup with Saltbox's Traefik labels, Authelia and the calendar feed.
 
 ## Authentication
 
@@ -215,31 +194,3 @@ Panelarr serves its own UI, so it sends no CORS headers: other websites cannot r
 ### Outbound requests
 
 Notification webhooks, SMTP servers and service connection tests may point at LAN and loopback addresses, which is normal in a homelab. Panelarr refuses cloud metadata endpoints, link-local and multicast addresses, and its own Docker API endpoint, after resolving hostnames. A stored API key or password is never sent to a new URL: if you change a service's URL, re-enter its key.
-
-### Saltbox with Traefik + Authelia
-
-```yaml
-services:
-  panelarr:
-    build: .
-    container_name: panelarr
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /opt/panelarr/config:/config
-    restart: unless-stopped
-    networks:
-      - saltbox
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.panelarr.rule=Host(`panelarr.your-domain.com`)"
-      - "traefik.http.routers.panelarr.entrypoints=websecure"
-      - "traefik.http.routers.panelarr.tls.certresolver=letsencrypt"
-      - "traefik.http.services.panelarr.loadbalancer.server.port=8000"
-      - "traefik.http.routers.panelarr.middlewares=authelia@docker"
-
-networks:
-  saltbox:
-    external: true
-```
-
-After the container starts, open the wizard and pick Reverse Proxy as the auth mode. Panelarr will detect Authelia's `Remote-User` header automatically.
