@@ -217,17 +217,17 @@ async def test_get_docker_version_swallows_http_status_error(
 @pytest.mark.parametrize(
     ("image", "target", "expected"),
     [
-        ("ghcr.io/thug-drama/panelarr:0.3.0", "0.3.1", "ghcr.io/thug-drama/panelarr:0.3.1"),
-        ("ghcr.io/thug-drama/panelarr:v0.3.0", "0.3.1", "ghcr.io/thug-drama/panelarr:v0.3.1"),
+        ("ghcr.io/syms-dev/panelarr:0.3.0", "0.3.1", "ghcr.io/syms-dev/panelarr:0.3.1"),
+        ("ghcr.io/syms-dev/panelarr:v0.3.0", "0.3.1", "ghcr.io/syms-dev/panelarr:v0.3.1"),
         (
-            "ghcr.io/thug-drama/panelarr:0.3.0-alpha",
+            "ghcr.io/syms-dev/panelarr:0.3.0-alpha",
             "0.3.1-alpha",
-            "ghcr.io/thug-drama/panelarr:0.3.1-alpha",
+            "ghcr.io/syms-dev/panelarr:0.3.1-alpha",
         ),
-        ("ghcr.io/thug-drama/panelarr:latest", "0.3.1", "ghcr.io/thug-drama/panelarr:latest"),
-        ("ghcr.io/thug-drama/panelarr:dev", "0.3.1", "ghcr.io/thug-drama/panelarr:dev"),
-        ("ghcr.io/thug-drama/panelarr:0.3.0", None, "ghcr.io/thug-drama/panelarr:0.3.0"),
-        ("ghcr.io/thug-drama/panelarr:0.3.0", "latest", "ghcr.io/thug-drama/panelarr:0.3.0"),
+        ("ghcr.io/syms-dev/panelarr:latest", "0.3.1", "ghcr.io/syms-dev/panelarr:latest"),
+        ("ghcr.io/syms-dev/panelarr:dev", "0.3.1", "ghcr.io/syms-dev/panelarr:dev"),
+        ("ghcr.io/syms-dev/panelarr:0.3.0", None, "ghcr.io/syms-dev/panelarr:0.3.0"),
+        ("ghcr.io/syms-dev/panelarr:0.3.0", "latest", "ghcr.io/syms-dev/panelarr:0.3.0"),
         ("localhost:5000/panelarr:1.0.0", "1.1.0", "localhost:5000/panelarr:1.1.0"),
         ("panelarr@sha256:ab", "1.1.0", "panelarr@sha256:ab"),
     ],
@@ -279,7 +279,7 @@ def _old_container() -> dict:
         "Id": "f" * 64,
         "Name": "/panelarr",
         "Config": {
-            "Image": "ghcr.io/thug-drama/panelarr:0.3.0",
+            "Image": "ghcr.io/syms-dev/panelarr:0.3.0",
             "Hostname": "f" * 12,
             "Env": ["PATH=/usr/bin", "PYTHON_VERSION=3.12", "API_TOKEN=s3cret", "TZ=UTC"],
             "Labels": {
@@ -338,7 +338,7 @@ def test_build_recreate_plan_fidelity() -> None:
         "Entrypoint": ["/entrypoint.sh"],
     }
     plan = docker.build_recreate_plan(
-        _old_container(), "ghcr.io/thug-drama/panelarr:0.3.1", image_cfg, env_file_path="/tmp/e"
+        _old_container(), "ghcr.io/syms-dev/panelarr:0.3.1", image_cfg, env_file_path="/tmp/e"
     )
     argv = plan.argv
     joined = " ".join(argv)
@@ -375,7 +375,7 @@ def test_build_recreate_plan_fidelity() -> None:
     ]:
         assert pair in pairs, pair
     assert "--hostname" not in argv  # default hostname == container id prefix
-    assert argv[-1] == "ghcr.io/thug-drama/panelarr:0.3.1"
+    assert argv[-1] == "ghcr.io/syms-dev/panelarr:0.3.1"
     assert plan.network_connects == [
         ["docker", "network", "connect", "--alias", "svc", "other", "panelarr"]
     ]
